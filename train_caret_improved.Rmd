@@ -1,0 +1,513 @@
+---
+title: "Vietnamese Healthcare Cost Prediction — Improved"
+author: "q"
+date: "2026-05-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1. Libraries
+
+```{r library}
+library(readxl)
+library(tidyverse)
+library(readr)
+library(fastDummies)
+library(xgboost)
+library(caret)
+```
+
+---
+
+## 2. Import Data
+
+```{r import}
+train_raw <- read_csv("train.csv")
+test_raw  <- read_csv("test.csv")
+```
+
+---
+
+## 3. Clean Data
+
+```{r clean}
+CAT_COLS <- c(
+  "GENDER", "MARRIED_STATUS",
+  "LOAI_THE_1", "LOAI_THE_2",
+  "CO_LAM_VIEC", "CO_DUOC_KY_HOP_DONG",
+  "CO_CONG_VIEC_THU_HAI", "CO_DUOC_KY_HOP_DONG_2",
+  "MA_NGHE_NGHIEP", "MA_NGHE_2",
+  "AGE_GROUP"
+)
+
+# Columns that exist only in train — used in Stage 1 stacking
+TARGET_COLS <- c("FRE_NGOAITRU", "FRE_NOITRU", "COST_NGOAITRU", "COST_NOITRU")
+
+clean_data <- function(df) {
+  df %>%
+    select(-ID) %>%
+
+    # Flag newborns
+    mutate(AGE_IS_ZERO = as.integer(AGE == 0)) %>%
+
+    # Structural NAs: no job → income = 0
+    mutate(across(
+      c(TIEN_LUONG_12T, TIEN_LE_TET, THUONG_PHU_CAP,
+        LUONG_CONG_VIEC_2, TIEN_LE_TET_2, THUONG_PHU_CAP_2,
+        LUONG_CONG_VIEC_3,
+        TIEN_TRO_CAP_THAT_NGHIEP, TIEN_TRO_CAP_THOI_VIEC_1_LAN,
+        LUONG_CHO_NGHI_HUU_BINH_THUONG, LUONG_CHO_NGHI_HUU_SOM,
+        TRO_CAP_MAT_SUC_LAO_DONG),
+      ~ replace_na(., 0)
+    )) %>%
+
+    # Categorical NAs → "UNKNOWN" / "NONE"
+    mutate(
+      MARRIED_STATUS        = replace_na(as.character(MARRIED_STATUS), "UNKNOWN"),
+      LOAI_THE_1            = replace_na(as.character(LOAI_THE_1),     "UNKNOWN"),
+      LOAI_THE_2            = replace_na(as.character(LOAI_THE_2),     "UNKNOWN"),
+      CO_LAM_VIEC           = replace_na(as.character(CO_LAM_VIEC),    "UNKNOWN"),
+      CO_DUOC_KY_HOP_DONG   = replace_na(as.character(CO_DUOC_KY_HOP_DONG),   "UNKNOWN"),
+      CO_DUOC_KY_HOP_DONG_2 = replace_na(as.character(CO_DUOC_KY_HOP_DONG_2), "UNKNOWN"),
+      MA_NGHE_2             = replace_na(as.character(MA_NGHE_2), "NONE"),
+      GENDER                = as.character(GENDER),
+      CO_CONG_VIEC_THU_HAI  = as.character(CO_CONG_VIEC_THU_HAI)
+    ) %>%
+
+    # Education: median impute (~14 % missing)
+    mutate(
+      HOC_DEN_LOP_MAY = replace_na(HOC_DEN_LOP_MAY,
+                                    median(HOC_DEN_LOP_MAY, na.rm = TRUE))
+    )
+}
+
+train_clean <- clean_data(train_raw)
+test_clean  <- clean_data(test_raw)
+```
+
+---
+
+## 4. Feature Engineering
+
+```{r feature-engineering}
+fe <- function(df, is_train = FALSE) {
+  # ── Base features ─────────────────────────────────────────────────────────
+  out <- df %>%
+    mutate(
+      TOTAL_INCOME = TIEN_LUONG_12T + TIEN_LE_TET + THUONG_PHU_CAP +
+                     LUONG_CONG_VIEC_2 + TIEN_LE_TET_2 + THUONG_PHU_CAP_2 +
+                     LUONG_CONG_VIEC_3,
+
+      HAS_INCOME_2 = as.integer(LUONG_CONG_VIEC_2 > 0),
+
+      AGE_GROUP = case_when(
+        AGE < 6   ~ "infant",
+        AGE < 18  ~ "child",
+        AGE < 40  ~ "young_adult",
+        AGE < 60  ~ "middle_age",
+        TRUE      ~ "elderly"
+      ),
+
+      AGE_SQ     = AGE ^ 2,
+      IS_ELDERLY = as.integer(AGE >= 60),
+
+      TOTAL_SOCIAL = TIEN_TRO_CAP_THAT_NGHIEP + TIEN_TRO_CAP_THOI_VIEC_1_LAN +
+                     LUONG_CHO_NGHI_HUU_BINH_THUONG + LUONG_CHO_NGHI_HUU_SOM +
+                     TRO_CAP_MAT_SUC_LAO_DONG,
+
+      HAS_SOCIAL_SUPPORT = as.integer(TOTAL_SOCIAL > 0)
+    )
+
+  # ── 11.4 Interaction & ratio features ─────────────────────────────────────
+  out <- out %>%
+    mutate(
+      # Income per year of age — proxy for socioeconomic status
+      INCOME_PER_AGE = TOTAL_INCOME / (AGE + 1),
+
+      # Log-income — compress extreme earners
+      LOG_INCOME     = log1p(TOTAL_INCOME),
+
+      # Log-social income
+      LOG_SOCIAL     = log1p(TOTAL_SOCIAL),
+
+      # Insurance card interaction (use raw columns before OHE)
+      HAS_BOTH_CARDS = as.integer(LOAI_THE_1 != "UNKNOWN" & LOAI_THE_2 != "UNKNOWN"),
+
+      # Age × income interaction
+      AGE_X_INCOME   = AGE * log1p(TOTAL_INCOME)
+    )
+
+  out
+}
+
+train_fe <- fe(train_clean, is_train = TRUE)
+test_fe  <- fe(test_clean,  is_train = FALSE)
+
+cat("Cols in train but not in test (should be target cols only):\n")
+print(setdiff(names(train_fe), names(test_fe)))
+```
+
+---
+
+## 5. Outlier Capping (11.7)
+
+Cap numeric features at the 99th percentile to reduce influence of extreme values.
+The cap thresholds are fitted on train only and applied to test.
+
+```{r outlier-cap}
+num_cols <- c("AGE", "TIEN_LUONG_12T", "TIEN_LE_TET", "THUONG_PHU_CAP",
+              "LUONG_CONG_VIEC_2", "TOTAL_INCOME", "TOTAL_SOCIAL",
+              "INCOME_PER_AGE", "LOG_INCOME", "LOG_SOCIAL")
+
+# Fit caps on train
+cap_vals <- train_fe %>%
+  summarise(across(all_of(num_cols), ~ quantile(., 0.99, na.rm = TRUE))) %>%
+  as.list()
+
+cap_col <- function(df, col, cap) {
+  df[[col]] <- pmin(df[[col]], cap)
+  df
+}
+
+for (col in num_cols) {
+  train_fe <- cap_col(train_fe, col, cap_vals[[col]])
+  test_fe  <- cap_col(test_fe,  col, cap_vals[[col]])
+}
+
+# Boxplot after capping
+train_fe %>%
+  select(all_of(num_cols)) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = name, y = value)) +
+  geom_boxplot(outlier.colour = "red", outlier.size = 0.5) +
+  facet_wrap(~name, scales = "free") +
+  theme_minimal() +
+  labs(title = "Boxplot of numeric features (after 99th-pct capping)")
+```
+
+---
+
+## 6. One-Hot Encoding & Column Alignment
+
+```{r dummy}
+encode <- function(df, cat_cols) {
+  dummy_cols(df,
+             select_columns          = cat_cols,
+             remove_selected_columns = TRUE,
+             remove_first_dummy      = TRUE)
+}
+
+train_dummy <- encode(train_fe, CAT_COLS)
+test_dummy  <- encode(test_fe,  CAT_COLS)
+
+# Feature columns = train cols minus target and label
+train_feature_cols <- setdiff(names(train_dummy), c("y", TARGET_COLS))
+
+# Add any columns that are in train but missing from test (unseen levels)
+missing_cols <- setdiff(train_feature_cols, names(test_dummy))
+if (length(missing_cols) > 0) {
+  cat("Adding missing columns to test:", missing_cols, "\n")
+  test_dummy[missing_cols] <- 0
+}
+
+# Keep only the training feature columns, in the same order
+test_dummy <- test_dummy[, train_feature_cols]
+
+cat("Train:", nrow(train_dummy), "×", length(train_feature_cols), "\n")
+cat("Test :", nrow(test_dummy),  "×", ncol(test_dummy),   "\n")
+cat("Column match:", all(train_feature_cols == names(test_dummy)), "\n")
+```
+
+---
+
+## 7. Prepare Matrices
+
+```{r prep-matrices}
+X_train <- train_dummy[, train_feature_cols] %>% as.data.frame()
+y_train <- train_dummy$y
+X_test  <- test_dummy %>% as.data.frame()
+
+# Sanity check — no data leak
+leak_check <- intersect(names(X_train),
+                        c("FRE_NGOAITRU", "FRE_NOITRU",
+                          "COST_NGOAITRU", "COST_NOITRU", "y"))
+if (length(leak_check) == 0) cat("OK — no data leak\n") else
+  cat("WARNING data leak:", leak_check, "\n")
+```
+
+---
+
+## 8. Stage 1 — Out-of-Fold Sub-component Predictions (11.1 Stacking)
+
+Build out-of-fold (OOF) predictions for each of the 4 sub-components using 5-fold CV.
+These OOF predictions become extra features for the final model — no leakage because
+each row is predicted by a model that never saw that row during training.
+Test predictions are the mean of 5 fold models.
+
+```{r oof-stacking}
+set.seed(42)
+K       <- 5
+folds   <- createFolds(y_train, k = K, list = TRUE, returnTrain = FALSE)
+
+# Quick xgboost params for sub-component models
+base_params <- list(
+  objective        = "reg:squarederror",
+  max_depth        = 5,
+  eta              = 0.05,
+  subsample        = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 10,
+  nthread          = parallel::detectCores()
+)
+
+# We train sub-models on log1p scale as well (right-skewed counts/costs)
+oof_predict_component <- function(component_name, X, y_comp, X_test_mat) {
+  oof_preds <- numeric(nrow(X))
+  test_preds_list <- vector("list", K)
+  y_log <- log1p(y_comp)
+
+  for (k in seq_len(K)) {
+    val_idx   <- folds[[k]]
+    train_idx <- setdiff(seq_len(nrow(X)), val_idx)
+
+    dtrain <- xgb.DMatrix(as.matrix(X[train_idx, ]), label = y_log[train_idx])
+    dval   <- xgb.DMatrix(as.matrix(X[val_idx,   ]), label = y_log[val_idx])
+    dtest  <- xgb.DMatrix(X_test_mat)
+
+    m <- xgb.train(
+      params  = base_params,
+      data    = dtrain,
+      nrounds = 500,
+      watchlist = list(val = dval),
+      early_stopping_rounds = 30,
+      verbose = 0
+    )
+
+    oof_preds[val_idx]  <- expm1(predict(m, dval))
+    test_preds_list[[k]] <- expm1(predict(m, dtest))
+  }
+
+  test_mean <- Reduce("+", test_preds_list) / K
+  list(oof = oof_preds, test = test_mean)
+}
+
+X_train_mat <- as.matrix(X_train)
+X_test_mat  <- as.matrix(X_test)
+
+cat("Building OOF predictions for FRE_NGOAITRU ...\n")
+res_fre_ng   <- oof_predict_component("FRE_NGOAITRU",   X_train, train_dummy$FRE_NGOAITRU,   X_test_mat)
+
+cat("Building OOF predictions for FRE_NOITRU ...\n")
+res_fre_no   <- oof_predict_component("FRE_NOITRU",     X_train, train_dummy$FRE_NOITRU,     X_test_mat)
+
+cat("Building OOF predictions for COST_NGOAITRU ...\n")
+res_cost_ng  <- oof_predict_component("COST_NGOAITRU",  X_train, train_dummy$COST_NGOAITRU,  X_test_mat)
+
+cat("Building OOF predictions for COST_NOITRU ...\n")
+res_cost_no  <- oof_predict_component("COST_NOITRU",    X_train, train_dummy$COST_NOITRU,    X_test_mat)
+
+# Append OOF predictions as new features
+X_train$OOF_FRE_NGOAITRU  <- pmax(res_fre_ng$oof,  0)
+X_train$OOF_FRE_NOITRU    <- pmax(res_fre_no$oof,  0)
+X_train$OOF_COST_NGOAITRU <- pmax(res_cost_ng$oof, 0)
+X_train$OOF_COST_NOITRU   <- pmax(res_cost_no$oof, 0)
+
+X_test$OOF_FRE_NGOAITRU   <- pmax(res_fre_ng$test,  0)
+X_test$OOF_FRE_NOITRU     <- pmax(res_fre_no$test,  0)
+X_test$OOF_COST_NGOAITRU  <- pmax(res_cost_ng$test, 0)
+X_test$OOF_COST_NOITRU    <- pmax(res_cost_no$test, 0)
+
+# Also add log versions of OOF predictions
+X_train$LOG_OOF_COST_NGOAITRU <- log1p(X_train$OOF_COST_NGOAITRU)
+X_train$LOG_OOF_COST_NOITRU   <- log1p(X_train$OOF_COST_NOITRU)
+X_test$LOG_OOF_COST_NGOAITRU  <- log1p(X_test$OOF_COST_NGOAITRU)
+X_test$LOG_OOF_COST_NOITRU    <- log1p(X_test$OOF_COST_NOITRU)
+
+cat("OOF stacking features added. New dimensions:\n")
+cat("X_train:", nrow(X_train), "×", ncol(X_train), "\n")
+cat("X_test :", nrow(X_test),  "×", ncol(X_test),  "\n")
+```
+
+---
+
+## 9. Two-Part (Hurdle) Model — Classifier (11.3)
+
+```{r hurdle-classifier}
+# Binary target: did this person have ANY cost?
+y_binary <- as.integer(y_train > 0)
+cat("Proportion with cost > 0:", mean(y_binary), "\n")
+
+ctrl_clf <- trainControl(
+  method        = "cv",
+  number        = 5,
+  verboseIter   = FALSE,
+  allowParallel = TRUE,
+  classProbs    = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+y_binary_factor <- factor(ifelse(y_binary == 1, "yes", "no"),
+                          levels = c("no", "yes"))
+
+clf_grid <- expand.grid(
+  nrounds          = c(300, 600),
+  max_depth        = c(4, 6),
+  eta              = c(0.05, 0.1),
+  gamma            = 1,
+  colsample_bytree = 0.8,
+  min_child_weight = 10,
+  subsample        = 0.8
+)
+
+set.seed(42)
+model_clf <- train(
+  x         = X_train,
+  y         = y_binary_factor,
+  method    = "xgbTree",
+  trControl = ctrl_clf,
+  tuneGrid  = clf_grid,
+  metric    = "ROC",
+  verbosity = 0
+)
+
+cat("Best classifier AUC:", max(model_clf$results$ROC), "\n")
+print(model_clf$bestTune)
+
+# Probabilities P(cost > 0)
+p_positive_train <- predict(model_clf, X_train, type = "prob")[, "yes"]
+p_positive_test  <- predict(model_clf, X_test,  type = "prob")[, "yes"]
+```
+
+---
+
+## 10. Log-Transform Target & Tune with caret (11.2 + 11.5)
+
+Train the main regressor on `log1p(y)` for positive-cost observations only.
+
+```{r caret-tune}
+# ── Filter to non-zero rows for regressor ──────────────────────────────────
+pos_idx     <- which(y_train > 0)
+X_train_pos <- X_train[pos_idx, ]
+y_train_pos <- y_train[pos_idx]
+y_train_log <- log1p(y_train_pos)
+
+cat("Training regressor on", length(pos_idx), "positive-cost rows\n")
+
+# ── Cross-validation setup ──────────────────────────────────────────────────
+ctrl <- trainControl(
+  method      = "cv",
+  number      = 5,
+  verboseIter = TRUE,
+  allowParallel = TRUE
+)
+
+# ── Hyperparameter grid ─────────────────────────────────────────────────────
+xgb_grid <- expand.grid(
+  nrounds          = c(500, 1000),
+  max_depth        = c(4, 6),
+  eta              = c(0.05, 0.01),
+  gamma            = c(1, 2),
+  colsample_bytree = c(0.8, 1.0),
+  min_child_weight = c(10, 20),
+  subsample        = c(0.7, 0.8)
+)
+
+cat("Total combinations:", nrow(xgb_grid), "\n")
+
+set.seed(42)
+model_caret <- train(
+  x         = X_train_pos,
+  y         = y_train_log,      # <<< log1p-transformed target
+  method    = "xgbTree",
+  trControl = ctrl,
+  tuneGrid  = xgb_grid,
+  metric    = "RMSE",
+  verbosity = 0
+)
+
+cat("\nBest hyperparameters:\n")
+print(model_caret$bestTune)
+cat("\nBest CV RMSE (log scale):", min(model_caret$results$RMSE), "\n")
+
+plot(model_caret, main = "CV RMSE by hyperparameter combination (log scale)")
+```
+
+---
+
+## 11. Refine `nrounds` with Early Stopping (11.5)
+
+```{r early-stopping}
+best_params       <- as.list(model_caret$bestTune)
+best_params$nrounds <- NULL   # xgb.cv controls nrounds itself
+best_params$objective <- "reg:squarederror"
+
+dtrain_pos <- xgb.DMatrix(as.matrix(X_train_pos), label = y_train_log)
+
+set.seed(42)
+cv_result <- xgb.cv(
+  params                = best_params,
+  data                  = dtrain_pos,
+  nrounds               = 3000,
+  nfold                 = 5,
+  metrics               = "rmse",
+  early_stopping_rounds = 50,
+  verbose               = 0
+)
+
+best_nrounds <- cv_result$best_iteration
+cat("Optimal nrounds from early stopping:", best_nrounds, "\n")
+
+# Re-train final model on ALL positive-cost rows with optimal nrounds
+final_model <- xgb.train(
+  params  = best_params,
+  data    = dtrain_pos,
+  nrounds = best_nrounds,
+  verbose = 0
+)
+
+cat("Final model trained with", best_nrounds, "rounds\n")
+```
+
+---
+
+## 12. Feature Importance
+
+```{r importance}
+imp_mat <- xgb.importance(model = final_model)
+xgb.plot.importance(imp_mat, top_n = 20, main = "Top 20 Feature Importance")
+```
+
+---
+
+## 13. Predict & Combine Hurdle Model (11.3)
+
+```{r predict-hurdle}
+# Regressor predictions (log scale → original scale)
+y_reg_pred_test  <- expm1(predict(final_model, xgb.DMatrix(as.matrix(X_test))))
+
+# Final prediction = P(cost > 0) × E[cost | cost > 0]
+y_pred_hurdle <- p_positive_test * pmax(y_reg_pred_test, 0)
+
+cat("Prediction summary (hurdle model):\n")
+print(summary(y_pred_hurdle))
+cat("Proportion predicted as zero (< 0.5 VND):", mean(y_pred_hurdle < 0.5), "\n")
+cat("Unique predictions:", length(unique(round(y_pred_hurdle, 3))), "\n")
+```
+
+---
+
+## 14. Submit
+
+```{r submit}
+submission <- data.frame(
+  ID    = test_raw$ID,
+  y.hat = pmax(y_pred_hurdle, 0)   # clip negatives — cost cannot be < 0
+)
+
+write_csv(submission, "submission.csv")
+cat("Saved submission.csv —", nrow(submission), "rows\n")
+head(submission)
+```
