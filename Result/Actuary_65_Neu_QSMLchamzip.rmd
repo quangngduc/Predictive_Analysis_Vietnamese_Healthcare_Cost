@@ -1,0 +1,1216 @@
+---
+title: "Final Assignment - Predictive Analytics - Actuarial Program"
+author:
+  - Phạm Quang Minh - 11230468
+  - Đinh Nho Thái Sơn - 11230486
+  - Nguyễn Đức Quang - 11230482
+  - Cù Huệ Linh - 11230452
+date: "May 2026"
+output:
+  html_document:
+    self_contained: yes
+    toc: yes
+    toc_depth: 3
+    theme: readable
+    highlight: kate
+header-includes:
+- \usepackage{tikz}
+- \usepackage{pgfplots}
+- \usetikzlibrary{arrows,automata,positioning}
+- \usepackage[utf8]{inputenc}
+- \usepackage{etoolbox}
+- \usepackage{xcolor}
+- \makeatletter
+- \preto{\@verbatim}{\topsep=0pt \partopsep=-0pt}
+- \makeatother
+- \DeclareMathOperator*{\argmin}{arg\,min}
+- \newcommand\tstrut{\rule{0pt}{3ex}}
+- \newcommand\bstrut{\rule[-2.5ex]{0pt}{0pt}}
+---
+
+```{css, echo=FALSE}
+/* ── EDA colour palette injected into readthedown chrome ─────────────── */
+/* Primary: EDA blue #2980b9  |  Accent: EDA orange #e67e22              */
+
+#sidebar {
+  background-color: #1a252f;
+}
+#sidebar h2 {
+  background-color: #2980b9;
+}
+#sidebar a, #sidebar a:visited {
+  color: #bdc3c7;
+}
+#sidebar a:hover {
+  color: #e67e22;
+  background-color: rgba(41,128,185,0.15);
+}
+#postamble {
+  background-color: #2980b9;
+  color: #ecf0f1;
+}
+h1, h2, h3, h4 {
+  color: #2c3e50;
+}
+h1 {
+  border-bottom: 2px solid #2980b9;
+  padding-bottom: 4px;
+}
+.nav-pills > li.active > a,
+.nav-pills > li.active > a:focus,
+.nav-pills > li.active > a:hover {
+  background-color: #2980b9;
+}
+a {
+  color: #2980b9;
+}
+a:hover {
+  color: #e67e22;
+}
+#content h2 {
+  background-color: #2980b9;
+  color: #ffffff;
+  padding: 6px 12px;
+  border-radius: 4px;
+}
+/* Highlight selected table rows */
+table.table tr.highlighted {
+  background-color: #eaf4fb !important;
+}
+/* Blockquote note style */
+blockquote {
+  border-left: 4px solid #e67e22;
+  background-color: #fef9e7;
+  padding: 8px 14px;
+  color: #5d4037;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(gridExtra)
+library(readxl)
+library(kableExtra)
+
+# ── Consistent EDA theme applied across all plots ─────────────────────────
+theme_eda <- function() {
+  theme_minimal(base_size = 13) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 14, hjust = 0),
+      plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0),
+      plot.caption  = element_text(size = 9,  color = "grey55", hjust = 1),
+      axis.title    = element_text(size = 11),
+      axis.text     = element_text(size = 10),
+      panel.grid.minor = element_blank(),
+      legend.position  = "none"
+    )
+}
+```
+
+------------------------------------------------------------------------
+
+# (a) Data Loading and Preprocessing
+
+## 1. Reading the Dataset
+
+The dataset train.csv is loaded using `data.table::fread()`, a high-performance reader chosen for its speed on moderately large tabular files. The critical loading argument is `integer64 = "numeric"`, which forces any 64-bit integer columns to be coerced to R's native numeric (double precision). Without this, large monetary totals such as annual salary sums would silently overflow R's 32-bit integer bounds.
+
+```{r read-train-pipeline-snippet, eval=FALSE}
+TRAIN_PATH <- "train.csv"
+train <- data.table::fread(TRAIN_PATH, integer64 = "numeric")
+```
+
+The training set contains **25,873 rows** and **32 columns**. Each row represents one insured individual. The primary key is `ID`, formatted as `<household_code>_<member_index>` (e.g., `00001037008_2`). This dual-purpose key encodes both the household the person belongs to and their ordinal position within it — a structure that the pipeline later exploits to build household-level aggregate features.
+
+The target variable `y` is a continuous, right-skewed cost measure bounded within [0, 15], with **a positive rate of approximately 18.3%**. This means roughly 82% of individuals incurred zero healthcare cost in the observed period — a strong zero-inflation that directly motivates the hurdle model architecture used in Steps 1 and 2.
+
+Immediately after loading, a sanity check confirms that y is consistent with `log1p(COST_NGOAITRU + COST_NOITRU)`, verifying that the target is a log-transformed total insurance cost rather than a raw value:
+
+```{r target-consistency-snippet, eval=FALSE}
+cost_sum  <- data.table::fifelse(is.na(train$COST_NGOAITRU), 0, train$COST_NGOAITRU) +
+             data.table::fifelse(is.na(train$COST_NOITRU),   0, train$COST_NOITRU)
+y <- train$y
+max_delta <- max(abs(y - log1p(cost_sum)))
+
+```
+
+## 2. Handling Missing Values
+
+The dataset has pervasive missingness, particularly in financial and employment columns. The table below summarises the key missing patterns:
+
+| **Column Group** | **Missing (\~)** | **Interpretation** |
+|------------------------|------------------------|------------------------|
+| `TIEN_LUONG_12T`, `TIEN_LE_TET`, `THUONG_PHU_CAP`, `CO_DUOC_KY_HOP_DONG` | 18,622 | Individual has no primary employment |
+| `LUONG_CONG_VIEC_2`, `TIEN_LE_TET_2`, `THUONG_PHU_CAP_2`, `CO_DUOC_KY_HOP_DONG_2` | 25,132 | No second job recorded |
+| `LUONG_CHO_NGHI_HUU_BINH_THUONG`, `LUONG_CHO_NGHI_HUU_SOM`, `TRO_CAP_MAT_SUC_LAO_DONG` | \~24,925 | Not retired/no disability benefit |
+| `LOAI_THE_2` | 9,875 | No secondary insurance card |
+| `MARRIED_STATUS`, `CO_LAM_VIEC`, `LOAI_THE_1` | 2,000-5,000 | Partially recorded demographics |
+
+Critically, the pipeline does **not** impute missing values with a global mean or median. Instead, it adopts a **domain-aware strategy**: for all monetary columns, NA is treated as a structural zero, the individual simply has no income from that source. Three derived columns are created per monetary variable: - **A binary missingness indicator** (`col_missing`), capturing whether the value was absent at all. - **A zero-filled raw value** (`col_zero`), for direct use in sums such as total household income. - **A log-transformed version** (`col_log1p`), applying log1p(max(z, 0)) to compress the heavy right-skewed distribution.
+
+```{r monetary-missing-snippet, eval=FALSE}
+all_dt[, paste0(col, '_missing') := as.integer(is.na(raw))]
+all_dt[, paste0(col, '_zero')    := z]
+all_dt[, paste0(col, '_log1p')   := log1p(pmax(z, 0.0))]
+
+```
+
+For categorical columns, NA is replaced by the explicit sentinel string "**NA**" before encoding. This ensures that missingness is treated as a **distinct learnable category** rather than being dropped from tree splits, so models can learn whether the absence of an insurance card type or marital status is itself predictive of cost:
+
+```{r categorical-na-snippet, eval=FALSE}
+cat_value <- function(x) {
+  out <- as.character(x)
+  out[is.na(out)] <- NA_CHR   # "__NA__"
+  out
+}
+```
+
+For household-level target-encoded features (e.g., mean `y` of other household members), any remaining `NA` values that appear after the group join for households appearing only in the test set are replaced with **global training-set averages** computed by `global_target_defaults()`. This provides a sensible fallback without introducing data leakage.
+
+## 3. Outlier Handling
+
+The pipeline does **not** apply explicit outlier removal or clipping to raw feature values. This is appropriate because both LightGBM and XGBoost are tree-based models inherently robust to extreme values, splits are based on rank-ordering, not absolute magnitude, so a very large salary or an unusual age does not distort training the way it would in a linear model.
+
+Instead, the outlier control is applied to **model predictions** rather than inputs, via two clipping functions:
+
+```{r prediction-clipping-snippet, eval=FALSE}
+clip_pred     <- function(pred) pmin(pmax(pred, PRED_MIN), PRED_MAX)
+                 # enforces [0, 15] — cost cannot be negative;
+                 # empirical max in train is ~14.15
+
+clip_residual <- function(x, limit = RESID_CLIP) pmin(pmax(x, -limit), limit)
+                 # RESID_CLIP = 1.5 — limits residual correction
+                 # in Step 5 to avoid overcorrection on outliers
+```
+
+The lower bound `PRED_MIN = 0` enforces the physical constraint that cost cannot be negative, while `PRED_MAX = 15.0` reflects that no training sample exceeds this value (maximum observed `y` ≈ 14.15). The residual clip `RESID_CLIP = 1.5` is a tunable parameter that controls how conservatively the final residual-correction stage (Step 5) adjusts the base ensemble prediction.
+
+## 4. Transformations Applied
+
+Beyond missing value handling, a comprehensive set of transformations is applied during feature engineering. These are summarised in the table below and described in detail in the following subsections:
+
+| **Transformation** | **Applied To** | **Purpose** |
+|------------------------|------------------------|------------------------|
+| `log1p()` | All monetary columns (after zero-fill) | Compress right-skewed income/cost distributions; stabilise gradient-based training |
+| Zero-fill + missing flag | All `MONEY_COLS` with NA | Structural zeros (no income source) + preserve missingness signal as binary feature |
+| `age\^2`, `log1p(AGE)` | `AGE` | Capture nonlinear health-cost curvature across life stages |
+| 8-bin discretisation | `AGE` | Domain-aware breakpoints: 0-5, 6-12, 13-18, 19-30, 31-45, 46-60, 61-75, 76+ |
+| Label encoding (integer) | All categoricals + interactions | Enables native categorical splits in LightGBM/XGBoost without ordinal assumption |
+| NA sentinel `'__NA__'` | Categorical NAs | Treats missingness as a learnable category rather than excluding from splits |
+| ID decomposition | ID column | Extracts household code + member index; generates prefix-based geo features |
+| Leave-one-out target encoding | Household-level target statistics | Leakage-free within-fold group statistics for y, cost, and frequency |
+| Prediction clipping [0, 15] | Model output | Enforce domain bounds (cost ≥ 0; empirical max \~14.15) |
+| Residual clipping [-1.5, 1.5] | Residual correction (Step 5) | Prevent overcorrection on extreme observations |
+
+### 4.1 Log Transformation of Monetary Columns
+
+All income and insurance cost variables are transformed with `log1p()` after zero-filling missing values. This compresses the heavily right-skewed distribution of monetary amounts (where most values are zero or small, but a few are very large) and places observations on a more comparable scale, improving the stability of gradient-based optimisation inside both LightGBM and XGBoost:
+
+```{r monetary-log-transform-snippet, eval=FALSE}
+all_dt[, paste0(col, '_log1p') := log1p(pmax(z, 0.0))]
+```
+
+Composite income variables `income_job1`, `income_job2`, `income_job3`, and income_total are also constructed as column sums and then log-transformed. These aggregates allow the model to reason about total economic capacity rather than individual pay components.
+
+### 4.2 Age Features
+
+Raw age is supplemented with several derived representations to capture the nonlinear relationship between age and healthcare cost: - `AGE^2` and `log1p(AGE)`: polynomial and log transforms to fit the U-shaped cost curve across life stages. - Binary flags: `is_child` (age \< 15), `is_working_age` (15–64), `is_elder` (age ≥ 60). - `age_bin`: 8 domain-meaningful brackets (0–5, 6–12, 13–18, 19–30, 31–45, 46–60, 61–75, 76+), treated as a categorical feature.
+
+### 4.3 Categorical Encoding
+
+After `NA` replacement with the `"__NA__"` sentinel, all categorical variables are label-encoded to integers using a vocabulary built jointly from both train and test sets. Unseen values at inference time are mapped to `-1`. The resulting integer columns are explicitly declared as categorical to the learners (`categorical_feature` in LightGBM; `feature_types = "c"` in XGBoost), enabling optimal many-valued split-finding algorithms rather than treating codes as ordinal numbers.
+
+### 4.4 ID Decomposition and Household Features
+
+The ID column is parsed with `tstrsplit(..., "_")` to extract the household code and member index. The household code is further truncated to prefixes of length 2, 3, 4, 5, 6, 8, and 11 characters, creating geographic proxy features (`hh_pref2`, ..., `hh_pref11`) that implicitly encode administrative region at different resolutions. Household-level aggregate features are then computed across all members: mean/min/max/std of age, income, and education level, as well as counts of children, elderly, and insured members and joined back to each individual row.
+
+### 4.5 Leave-One-Out Target Encoding
+
+Household-level statistics of the target variable `y`, including mean, sum, positive rate, and cost totals, are used as features. During cross-validation, these are computed using only the training fold with the **current observation excluded** (leave-one-out), preventing within-fold target leakage. For test inference, the statistics are derived from the full training fold without exclusion. Any household with no match in the training fold (new households in test) receives global training-set average values from `global_target_defaults()`.
+
+### 4.6 Interaction Features
+
+Several cross-product categorical features are created as string concatenations before encoding:
+
+-   `agebin_gender`: joint age bracket × gender.
+-   `job_work`: occupation code × employment status.
+-   `insurance_card`: insurance holder flag × card type.
+-   `geo_agebin`: geographic prefix (`hh_pref5`) × age bracket.
+
+These interaction columns are subsequently label-encoded along with all other categoricals, allowing tree models to directly split on joint combinations without requiring polynomial feature expansion.
+
+------------------------------------------------------------------------
+
+# (b) Exploratory Data Analysis
+
+## 1. Data Preprocessing – Income Variables
+
+```{r load-data}
+train_csv <- read_csv("train.csv")
+
+train_csv <- train_csv %>%
+  mutate(
+    # Convert monetary columns from character/mixed to numeric
+    across(c(TIEN_LUONG_12T, TIEN_LE_TET, THUONG_PHU_CAP,
+             LUONG_CONG_VIEC_2, LUONG_CONG_VIEC_3,
+             LUONG_CHO_NGHI_HUU_BINH_THUONG, LUONG_CHO_NGHI_HUU_SOM,
+             TRO_CAP_MAT_SUC_LAO_DONG, COST_NGOAITRU, COST_NOITRU,
+             TIEN_TRO_CAP_THAT_NGHIEP, TIEN_TRO_CAP_THOI_VIEC_1_LAN),
+           ~as.numeric(.))
+  ) %>%
+  mutate(
+    # Total earned income (salary + bonus + allowances + secondary jobs)
+    TOTAL_INCOME = TIEN_LUONG_12T + TIEN_LE_TET + THUONG_PHU_CAP +
+                   LUONG_CONG_VIEC_2 + LUONG_CONG_VIEC_3,
+    # Log-transform of target to handle right-skew and zero-inflation
+    log_y = log1p(y)
+  )
+
+cat("Data type of TOTAL_INCOME:", class(train_csv$TOTAL_INCOME), "\n")
+```
+
+```{r income-summary-table}
+income_summary <- train_csv %>%
+  summarise(
+    Total_Observations = n(),
+    Missing_Income     = sum(is.na(TOTAL_INCOME)),
+    Zero_Income        = sum(TOTAL_INCOME == 0, na.rm = TRUE),
+    Positive_Income    = sum(TOTAL_INCOME > 0,  na.rm = TRUE)
+  ) %>%
+  mutate(
+    Percent_Missing  = round(Missing_Income  / Total_Observations * 100, 2),
+    Percent_Zero     = round(Zero_Income     / Total_Observations * 100, 2),
+    Percent_Positive = round(Positive_Income / Total_Observations * 100, 2)
+  )
+
+income_summary %>%
+  select(Total_Observations,
+         Missing_Income, Percent_Missing,
+         Zero_Income,    Percent_Zero,
+         Positive_Income, Percent_Positive) %>%
+  knitr::kable(caption = "Table 1: Composition of TOTAL_INCOME (Missing, Zero, Positive)", align = "r")
+```
+
+The analysis of `TOTAL_INCOME` (the sum of labor-related income components) reveals an extremely high rate of missing values. Out of **25,873 observations**, **25,691 records (99.3%)** have missing `TOTAL_INCOME`, and only **182 observations (0.7%)** carry positive income values. There are no records with exactly zero income.
+
+This near-total missingness is **not a data quality failure** , it is structurally explained by the composition of the population:
+
+-   A large share of individuals are **unemployed, retired, children, or students** who have no wage-generating activity by definition.
+-   Several source variables (e.g. `TIEN_LUONG_12T`, `LUONG_CONG_VIEC_2`) were stored as strings or contained literal `"NA"` values, requiring explicit conversion to numeric before aggregation.
+
+**Implications for the target variable `y` (healthcare cost):**
+
+-   The overwhelming prevalence of missing income directly explains the **strong zero-inflation** in `y`: economically inactive individuals tend to have lower healthcare utilisation on average.
+-   This missingness is **MNAR (Missing Not At Random)** — its absence carries real economic meaning and should not be discarded.
+-   **Recommended preprocessing:** Replace missing income values with `0`, reflecting that these individuals have no recorded labour income. This is standard practice in actuarial cost modelling.
+
+------------------------------------------------------------------------
+
+## 2. Missing Values Analysis
+
+```{r missing-summary}
+missing_summary <- train_csv %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Percent = round(Missing_Count / nrow(train_csv) * 100, 2)) %>%
+  arrange(desc(Missing_Count))
+
+missing_summary %>%
+  filter(Missing_Count > 0) %>%
+  head(15) %>%
+  knitr::kable(
+    caption = "Table 2: Top 15 Variables with Highest Missing Rates",
+    align = "lrr",
+    col.names = c("Variable", "Missing Count", "Missing (%)"))
+
+cat("Dataset dimensions:", paste(dim(train_csv), collapse = " × "), "\n")
+cat("Total missing cells:", format(sum(is.na(train_csv)), big.mark = ","), "\n")
+```
+
+```{r missing-bar-chart, fig.height=6}
+missing_summary %>%
+  filter(Missing_Count > 0) %>%
+  slice_head(n = 15) %>%
+  mutate(Variable = fct_reorder(Variable, Percent)) %>%
+  ggplot(aes(x = Variable, y = Percent, fill = Percent)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(Percent, "%")),
+            hjust = -0.1, size = 3.5, color = "grey30") +
+  coord_flip() +
+  scale_fill_gradient(low = "#f7b731", high = "#c0392b") +
+  scale_y_continuous(limits = c(0, 105), labels = label_percent(scale = 1)) +
+  labs(
+    title    = "Top 15 Variables by Missing Rate",
+    subtitle = "Income-related variables dominate — missingness is structurally meaningful (MNAR)",
+    x        = NULL,
+    y        = "Missing (%)",
+    caption  = "Source: train_csv | n = 25,873 observations"
+  ) +
+  theme_eda()
+```
+
+The dataset contains a total of **252,398 missing values**. Missingness is heavily concentrated in **labour-income and benefit variables**, with `TOTAL_INCOME` at 99.3%, `LUONG_CONG_VIEC_2` at 97.1%, and `LUONG_CHO_NGHI_HUU_SOM` at 96.3%.
+
+This is because:
+
+-   **Non-working population**: retirees, children, students, and the unemployed.
+-   **Benefit-conditional variables**: unemployment and redundancy pay are only defined for claimants.
+
+**Preprocessing decisions:**
+
+| Variable type | Action | Rationale |
+|------------------------|------------------------|------------------------|
+| Monetary (salary, bonus, etc.) | Replace NA → 0 | Accurately reflects zero labour income |
+| Occupation code (`MA_NGHE_NGHIEP`) | Replace NA → "Unknown" | Preserves category integrity |
+
+**Why tree-based models are preferred here:** Random Forest, XGBoost, and LightGBM can natively handle missing values, learn from missingness patterns, and manage the non-linear relationships and zero-inflation present in `y` all without requiring imputation.
+
+------------------------------------------------------------------------
+
+## 3. Distribution of the Target Variable `y` and `log(1+y)`
+
+```{r dist-y, fig.height=5}
+ggplot(train_csv, aes(x = y)) +
+  geom_histogram(bins = 60, fill = "#2980b9", color = "white", alpha = 0.85) +
+  scale_x_continuous(labels = label_comma()) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    title    = "Distribution of Healthcare Cost (y)",
+    subtitle = "Extreme right-skew and mass at zero — typical of healthcare expenditure data",
+    x        = "Healthcare Cost (y)",
+    y        = "Number of Individuals",
+    caption  = "Raw scale; majority of individuals have y = 0"
+  ) +
+  theme_eda()
+```
+
+```{r dist-logy, fig.height=5}
+ggplot(train_csv, aes(x = log_y)) +
+  geom_histogram(bins = 50, fill = "#e67e22", color = "white", alpha = 0.85) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    title    = "Distribution of Log-Transformed Cost — log(1 + y)",
+    subtitle = "Log transformation compresses the right tail; spike at 0 represents individuals with y = 0",
+    x        = "log(1 + y)",
+    y        = "Number of Individuals",
+    caption  = "log1p(0) = 0; spike at left is retained zero-inflation"
+  ) +
+  theme_eda()
+```
+
+The raw distribution of `y` shows the two hallmark features of healthcare cost data:
+
+-   **Zero-inflation**: a large mass of observations at exactly zero.
+-   **Extreme right-skew**: a long upper tail driven by high-cost individuals.
+
+The `log(1 + y)` transformation compresses the tail substantially. The spike at `log_y = 0` confirms the zero-inflation is genuine. Both features must be accounted for in modelling.
+
+------------------------------------------------------------------------
+
+## 4. Proportion of `y = 0` vs `y > 0`
+
+```{r y-proportion}
+train_csv %>%
+  mutate(y_status = ifelse(y == 0, "y = 0 (No Cost)", "y > 0 (Positive Cost)")) %>%
+  count(y_status) %>%
+  mutate(Percent = round(n / sum(n) * 100, 2)) %>%
+  knitr::kable(
+    caption = "Table 3: Proportion of Zero vs Positive Healthcare Cost",
+    align   = "lrr",
+    col.names = c("Cost Status", "Count", "Percent (%)"))
+```
+
+The target variable `y` (total annual healthcare cost) shows a very strong **zero-inflation** characteristic. Out of 25,873 observations, **21,129 observations (81.66%)** have `y = 0`, while only **4,744 observations (18.34%)** have positive healthcare costs.
+
+This high proportion of zeros is typical in healthcare cost data, indicating that the majority of insured individuals did not use any medical services or had negligible costs during the year. The small group with positive costs (18.34%) is responsible for nearly all healthcare expenditure in the dataset — a common pattern known as "high-cost, low-frequency" in insurance modeling.
+
+This characteristic has important implications for modeling: 
+-   Standard linear regression models are likely to perform poorly. 
+-   The log transformation `log(1 + y)` helps reduce skewness but does not fully resolve the zero-inflation issue. 
+-   The data is highly suitable for **tree-based models** such as Random Forest, XGBoost, or LightGBM, which can naturally handle zero values, categorical variables, missing data, and non-linear relationships.
+
+------------------------------------------------------------------------
+
+## 5. Distribution of Age
+
+```{r dist-age, fig.height=5}
+ggplot(train_csv, aes(x = AGE)) +
+  geom_histogram(bins = 35, fill = "#8e44ad", color = "white", alpha = 0.85) +
+  scale_x_continuous(breaks = seq(0, 100, by = 10)) +
+  scale_y_continuous(labels = label_comma()) +
+  geom_vline(xintercept = median(train_csv$AGE, na.rm = TRUE),
+             linetype = "dashed", color = "#c0392b", linewidth = 0.8) +
+  annotate("text", x = median(train_csv$AGE, na.rm = TRUE) + 2,
+           y = Inf, vjust = 2, hjust = 0, size = 3.5, color = "#c0392b",
+           label = paste0("Median = ", round(median(train_csv$AGE, na.rm = TRUE)))) +
+  labs(
+    title    = "Distribution of Age",
+    subtitle = "Dashed line marks the median age; the population spans all life stages",
+    x        = "Age (years)",
+    y        = "Number of Individuals",
+    caption  = "Source: train_csv"
+  ) +
+  theme_eda()
+```
+
+The age distribution spans a wide range from infants to the elderly, confirming that the dataset represents the **general population**. The relatively even spread is consistent with a household-level survey or national health database. The oldest age groups will be particularly important predictors of `y`, as healthcare costs typically escalate sharply with age.
+
+------------------------------------------------------------------------
+
+## 6. Relationship Between Age and Log(1+y)
+
+```{r age-vs-logy, fig.height=5}
+ggplot(train_csv, aes(x = AGE, y = log_y)) +
+  geom_point(alpha = 0.15, color = "#2980b9", size = 0.9) +
+  geom_smooth(method = "loess", color = "#c0392b",
+              linewidth = 1.2, se = TRUE, fill = "#fadbd8") +
+  scale_x_continuous(breaks = seq(0, 100, by = 10)) +
+  labs(
+    title    = "Age vs. Log(1 + y): Healthcare Cost by Age",
+    subtitle = "LOESS curve reveals a non-linear U-shape — elevated costs in infancy and old age",
+    x        = "Age (years)",
+    y        = "log(1 + y) — Log-scaled Healthcare Cost",
+    caption  = "Red band = 95% confidence interval around LOESS trend; alpha = 0.15 to show density"
+  ) +
+  theme_eda()
+```
+
+The LOESS smooth reveals a clear **non-linear, U-shaped relationship**:
+
+-   **Infants and young children** show slightly elevated costs due to paediatric care.
+-   **Young to middle-aged adults** have the lowest average costs.
+-   **Older adults (60+)** show a steep rise driven by chronic disease and hospitalisation.
+
+This non-linearity confirms that a **tree-based model** or **polynomial/spline regression** will outperform a plain linear model for this feature.
+
+------------------------------------------------------------------------
+
+## 7. Comparison of log(1+y) Across Demographic Groups
+
+```{r factor-conversion}
+# ── Convert numeric-coded categoricals to labeled factors ─────────────────
+train_csv <- train_csv %>%
+  mutate(
+    GENDER_f = factor(GENDER,
+                      levels = c(1, 2),
+                      labels = c("Male", "Female")),
+
+    INSURANCE_f = factor(CO_THE_BAO_HIEM,
+                         levels = c(0, 1),
+                         labels = c("Not Insured", "Insured")),
+
+    EMPLOYED_f = factor(CO_LAM_VIEC,
+                        levels = c(1, 2),
+                        labels = c("Working", "Not Working")),
+
+    MARRIED_f = factor(MARRIED_STATUS,
+                       levels = c(1, 2, 3, 4, 5),
+                       labels = c("Single", "Married", "Divorced", "Separated", "Widowed")),
+
+    OCC_f = factor(ifelse(is.na(MA_NGHE_NGHIEP) | MA_NGHE_NGHIEP == "",
+                          "Unknown", as.character(MA_NGHE_NGHIEP)))
+  )
+```
+
+```{r violin-gender, fig.height=5}
+gender_data <- train_csv %>% filter(!is.na(GENDER_f))
+
+ggplot(gender_data, aes(x = GENDER_f, y = log_y, fill = GENDER_f)) +
+  geom_violin(
+    trim = TRUE, alpha = 0.65,
+    color = "grey30", linewidth = 0.35,
+    draw_quantiles = c(0.25, 0.5, 0.75)
+  ) +
+  stat_summary(fun = mean, geom = "point", shape = 18,
+               size = 4, color = "#2c3e50") +
+  scale_fill_manual(values = c("Male" = "#3498db", "Female" = "#e74c3c")) +
+  scale_y_continuous(breaks = 0:4) +
+  labs(
+    title    = "Healthcare Cost Distribution by Gender",
+    subtitle = "Lines inside violin = Q1, median, Q3 — diamond = mean",
+    x        = NULL,
+    y        = "log(1 + y) — Log-scaled Healthcare Cost",
+    caption  = "Excludes individuals with missing gender."
+  ) +
+  theme_eda()
+```
+
+```{r insurance-work-crosstab}
+train_csv %>%
+  filter(!is.na(EMPLOYED_f), !is.na(INSURANCE_f)) %>%
+  count(EMPLOYED_f, INSURANCE_f) %>%
+  mutate(Pct = round(n / sum(n) * 100, 1)) %>%
+  knitr::kable(
+    caption   = "Table: Insurance Coverage by Employment Status",
+    align     = "llrr",
+    col.names = c("Employment", "Insurance", "Count", "% of total"))
+```
+
+> **Note:** In Vietnam, the state provides BHYT health insurance cards to unemployed and non-working citizens. The "Insured" group therefore contains both premium-paying workers and non-workers.
+
+```{r violin-insurance, fig.height=5}
+ins_data <- train_csv %>% filter(!is.na(INSURANCE_f))
+
+ggplot(ins_data, aes(x = INSURANCE_f, y = log_y, fill = INSURANCE_f)) +
+  geom_violin(
+    trim = TRUE, alpha = 0.65,
+    color = "grey30", linewidth = 0.35,
+    draw_quantiles = c(0.25, 0.5, 0.75)
+  ) +
+  stat_summary(fun = mean, geom = "point", shape = 18,
+               size = 4, color = "#2c3e50") +
+  scale_fill_manual(values = c("Not Insured" = "#95a5a6", "Insured" = "#27ae60")) +
+  scale_y_continuous(breaks = 0:4) +
+  labs(
+    title    = "Healthcare Cost Distribution by Insurance Status",
+    subtitle = "Insured group includes both premium-paying workers and state-subsidised non-workers (BHYT)",
+    x        = NULL,
+    y        = "log(1 + y) — Log-scaled Healthcare Cost",
+    caption  = "Lines inside violin = Q1, median, Q3 — diamond = mean"
+  ) +
+  theme_eda()
+```
+
+```{r violin-employment, fig.height=5}
+emp_data <- train_csv %>% filter(!is.na(EMPLOYED_f))
+
+ggplot(emp_data, aes(x = EMPLOYED_f, y = log_y, fill = EMPLOYED_f)) +
+  geom_violin(
+    trim = TRUE, alpha = 0.65,
+    color = "grey30", linewidth = 0.35,
+    draw_quantiles = c(0.25, 0.5, 0.75)
+  ) +
+  stat_summary(fun = mean, geom = "point", shape = 18,
+               size = 4, color = "#c0392b") +
+  scale_fill_manual(values = c("Not Working" = "#e67e22", "Working" = "#2c3e50")) +
+  scale_y_continuous(breaks = 0:4) +
+  labs(
+    title    = "Healthcare Cost Distribution by Employment Status",
+    subtitle = "Not Working = CO_LAM_VIEC 2 (UNEMPLOY); Working = all other occupation groups",
+    x        = NULL,
+    y        = "log(1 + y) — Log-scaled Healthcare Cost",
+    caption  = "Lines inside violin = Q1, median, Q3 — diamond = mean. 2,132 UNEMPLOY with missing CO_LAM_VIEC excluded."
+  ) +
+  theme_eda()
+```
+
+```{r violin-marital, fig.height=5}
+mar_data <- train_csv %>% filter(!is.na(MARRIED_f))
+
+ggplot(mar_data, aes(x = MARRIED_f, y = log_y, fill = MARRIED_f)) +
+  geom_violin(
+    trim = TRUE, alpha = 0.65,
+    color = "grey30", linewidth = 0.35,
+    draw_quantiles = c(0.25, 0.5, 0.75)
+  ) +
+  stat_summary(fun = mean, geom = "point", shape = 18,
+               size = 4, color = "#2c3e50") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(breaks = 0:4) +
+  labs(
+    title    = "Healthcare Cost Distribution by Marital Status",
+    subtitle = "Widowed individuals tend to have elevated costs, likely reflecting their older age profile",
+    x        = NULL,
+    y        = "log(1 + y) — Log-scaled Healthcare Cost",
+    caption  = "Lines inside violin = Q1, median, Q3 — diamond = mean"
+  ) +
+  theme_eda()
+```
+
+```{r violin-occupation, fig.height=8}
+occ_data <- train_csv %>%
+  filter(!is.na(OCC_f)) %>%
+  mutate(OCC_f = fct_reorder(OCC_f, log_y, .fun = median, na.rm = TRUE))
+
+ggplot(occ_data, aes(x = OCC_f, y = log_y, fill = OCC_f)) +
+  geom_violin(
+    trim = TRUE, alpha = 0.65,
+    color = "grey30", linewidth = 0.3,
+    draw_quantiles = c(0.25, 0.5, 0.75)
+  ) +
+  stat_summary(fun = median, geom = "point", shape = 18,
+               size = 2.5, color = "#1a1a2e") +
+  coord_flip() +
+  scale_fill_viridis_d(option = "plasma", begin = 0.1, end = 0.9) +
+  scale_y_continuous(breaks = 0:4) +
+  labs(
+    title    = "Healthcare Cost Distribution by Occupation Code",
+    subtitle = "Ordered by median cost (lowest → highest); occupation reflects health-risk exposure and SES",
+    x        = "Occupation Code",
+    y        = "log(1 + y) — Log-scaled Healthcare Cost",
+    caption  = "Violin = full distribution; sorted by median log(1+y)"
+  ) +
+  theme_eda() +
+  theme(axis.text.y = element_text(size = 8),
+        legend.position = "none")
+```
+
+The violin comparisons reveal several important patterns:
+
+-   **Gender**: Differences in median healthcare cost are likely modest, though the spread may vary — particularly for reproductive-age women.
+-   **Insurance status**: The "Insured" group contains both premium-paying employees and state-subsidised non-workers (BHYT). Higher recorded costs for insured individuals reflect greater utilisation enabled by coverage. Uninsured individuals likely under-report costs or forgo care entirely.
+-   **Employment status**: Non-workers (predominantly UNEMPLOY) skew toward higher costs driven by the elderly and chronically ill. Note that 2,132 individuals coded UNEMPLOY with missing `CO_LAM_VIEC` are excluded.
+-   **Marital status**: Widowed individuals tend to have elevated costs reflecting their older age profile rather than a causal effect of marital status.
+-   **Occupation code**: UNEMPLOY dominates at 10,962 records. Considerable heterogeneity exists across working occupations — occupation acts as a proxy for socioeconomic status and health risk exposure.
+
+------------------------------------------------------------------------
+
+## 8. Income Analysis
+
+```{r income-stats}
+summary_income <- train_csv %>%
+  summarise(
+    Mean_Income       = round(mean(TOTAL_INCOME,   na.rm = TRUE), 0),
+    Median_Income     = round(median(TOTAL_INCOME, na.rm = TRUE), 0),
+    Max_Income        = round(max(TOTAL_INCOME,    na.rm = TRUE), 0),
+    Zero_Income_Rate  = round(mean(TOTAL_INCOME == 0, na.rm = TRUE) * 100, 2)
+  )
+
+summary_income %>%
+  knitr::kable(
+    caption = "Table 4: Summary Statistics for Total Labour Income",
+    align = "r",
+    col.names = c("Mean Income", "Median Income", "Max Income", "Zero Income Rate (%)"))
+```
+
+```{r dist-income, fig.height=5}
+ggplot(train_csv, aes(x = TOTAL_INCOME)) +
+  geom_histogram(bins = 50, fill = "#27ae60", color = "white", alpha = 0.85) +
+  scale_x_continuous(labels = label_comma()) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    title    = "Distribution of Total Labour Income",
+    subtitle = "Among the 0.7% of individuals with positive income — strong right-skew persists",
+    x        = "Total Labour Income (TOTAL_INCOME)",
+    y        = "Number of Individuals",
+    caption  = "Note: 99.3% of observations have missing TOTAL_INCOME and are excluded from this chart"
+  ) +
+  theme_eda()
+```
+
+```{r income-vs-logy, fig.height=5}
+ggplot(train_csv, aes(x = log1p(TOTAL_INCOME), y = log_y)) +
+  geom_point(alpha = 0.35, color = "#2980b9", size = 1.2) +
+  geom_smooth(method = "lm", color = "#c0392b",
+              linewidth = 1.1, se = TRUE, fill = "#fadbd8") +
+  labs(
+    title    = "Log(Total Income) vs. Log(1 + y): Income–Cost Relationship",
+    subtitle = "Positive association among earners — higher income linked to greater healthcare utilisation",
+    x        = "log(1 + TOTAL_INCOME) — Log-scaled Labour Income",
+    y        = "log(1 + y) — Log-scaled Healthcare Cost",
+    caption  = "Linear fit with 95% CI shown in red; n limited to individuals with positive TOTAL_INCOME"
+  ) +
+  theme_eda()
+```
+
+Despite covering only 0.7% of the population, the 182 individuals with positive `TOTAL_INCOME` display a notable **positive association** between labour income and healthcare cost (in log-log space):
+
+-   Higher earners tend to report higher healthcare expenditure — reflecting **greater access to care**, willingness to pay out-of-pocket, and higher formal insurance coverage.
+-   The relationship is not perfectly linear even after log-transformation, consistent with diminishing marginal healthcare spending at very high incomes.
+
+**Overall conclusion on income as a predictor:** `TOTAL_INCOME` is useful where available, but its near-universal missingness means the model must rely primarily on demographic and behavioural features (`AGE`, `CO_THE_BAO_HIEM`, `CO_LAM_VIEC`). The missingness pattern itself should be encoded as a binary feature.
+
+------------------------------------------------------------------------
+
+# (c) Modeling
+
+## 1. Overview
+
+The modeling pipeline follows a five-stage ensemble strategy. Each stage builds on the predictions of the previous one, progressively reducing the validation error. The target variable throughout is the log-transformed total annual healthcare cost:
+
+$$y_i = \log(1 + \text{total cost}_i)$$
+
+so all errors reported below are RMSE on this log-transformed scale, which is equivalent to the competition's RMSLE metric.
+
+```{r pipeline-overview}
+pipeline_tbl <- data.frame(
+  Stage = c("1", "2", "3", "4", "5"),
+  Description = c(
+    "LightGBM base models (regression + hurdle variants)",
+    "XGBoost base models (regression + hurdle variants)",
+    "Softmax-weighted blend of all LGB and XGB outputs",
+    "Ridge regression meta-learner stacked on OOF predictions",
+    "Residual correction via a shallow XGBoost on Stage 4 errors"
+  ),
+  `Models trained` = c("4", "5", "1 blended ensemble",
+                       "1 meta-learner", "3 candidate correctors"),
+  `Best OOF RMSE` = c("2.2855", "2.2778", "2.2706",
+                      "2.2692", "2.2693"),
+  check.names = FALSE
+)
+
+kable(pipeline_tbl, align = c("c","l","c","c"), booktabs = TRUE,
+      caption = "Pipeline overview") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  column_spec(1, bold = TRUE, width = "1.5cm") %>%
+  column_spec(2, width = "9cm") %>%
+  column_spec(3, width = "4cm") %>%
+  column_spec(4, bold = TRUE, width = "3.5cm")
+```
+
+------------------------------------------------------------------------
+
+## 2. Validation Setup
+
+All models in this pipeline share the same cross-validation (CV) framework, described here once to avoid repetition.
+
+### 2.1 What is Cross-Validation?
+
+In a standard train/test split we reserve one fixed portion of the data for evaluation. Cross-validation generalises this: the data is split into $K$ equal **folds**, and the evaluation is repeated $K$ times, each time holding out a different fold as the test set and training on the remaining $K-1$ folds. The final score is averaged across all $K$ held-out evaluations.
+
+We use $K = 10$ folds throughout.
+
+### 2.2 Out-of-Fold (OOF) Predictions
+
+Cross-validation produces a useful by-product: for each observation we obtain a prediction from the fold where it was in the held-out set. **Each observation is therefore predicted by a model that was trained without ever seeing that observation** — eliminating any risk of in-sample optimism. Assembling these predictions across all folds gives a full-length **out-of-fold (OOF) prediction vector** $\hat{\mathbf{y}}^{\text{OOF}}$.
+
+The reported **OOF RMSE** is then:
+
+$$\text{OOF RMSE} = \sqrt{\frac{1}{n}\sum_{i=1}^n \bigl(\hat{y}_i^{\text{OOF}} - y_i\bigr)^2}$$
+
+This acts as an honest, hold-out estimate of generalisation error. The final test predictions are produced by averaging the predictions from all 10 trained models — one per fold.
+
+### 2.3 Stratified Fold Assignment
+
+Because the target distribution is highly skewed — only **18.3%** of individuals have any healthcare cost at all — a purely random fold assignment would distribute zero-cost and high-cost individuals unevenly across folds.
+
+To prevent this, observations are sorted into six **strata** based on their cost level: one stratum for zero-cost individuals, and five strata for positive-cost individuals grouped by cost quantile. Fold assignment then samples proportionally within each stratum, so every fold contains approximately the same fraction of zero-cost and high-cost observations.
+
+------------------------------------------------------------------------
+
+## 3. Stages 1 & 2 — Gradient Boosted Trees
+
+Both LightGBM and XGBoost belong to the family of **gradient boosted decision trees (GBDT)**. They share the same core algorithm, so we describe the mathematics once before discussing the specific configurations used.
+
+### 3.1 Intuition
+
+A single decision tree often underfits complex data. The key idea of boosting is to build many trees *sequentially*, where each new tree focuses on correcting the mistakes of all the trees built so far. Think of it as assembling a team of specialists: the first tree makes a rough prediction, the second tree patches up the errors, the third patches up what the second missed, and so on.
+
+### 3.2 Sequential Additive Model
+
+After $M$ trees, the model's prediction is the sum of all trees, each scaled by a **learning rate** $\eta \in (0, 1]$:
+
+$$\hat{F}^{(m)}(\mathbf{x}) = \hat{F}^{(m-1)}(\mathbf{x}) + \eta \cdot f_m(\mathbf{x})$$
+
+Starting from a constant $\hat{F}^{(0)}$, the full prediction after $M$ steps is:
+
+$$\hat{F}(\mathbf{x}) = \hat{F}^{(0)} + \sum_{m=1}^{M} \eta \cdot f_m(\mathbf{x})$$
+
+### 3.3 Finding Each New Tree: the Objective
+
+At step $m$ we want to find the tree $f_m$ that minimises the total loss. Using a **second-order Taylor approximation**:
+
+$$\mathcal{L}^{(m)} \approx \sum_{i=1}^{n} \Bigl[
+  \underbrace{g_i}_{\text{slope}} \cdot f_m(\mathbf{x}_i)
+  + \tfrac{1}{2}\underbrace{h_i}_{\text{curvature}} \cdot f_m(\mathbf{x}_i)^2
+\Bigr] + \Omega(f_m)$$
+
+where:
+
+-   $g_i = \dfrac{\partial\,\ell(y_i,\,\hat{F}^{(m-1)})}{\partial\,\hat{F}^{(m-1)}}$ — the **gradient**
+-   $h_i = \dfrac{\partial^2\,\ell(y_i,\,\hat{F}^{(m-1)})}{\partial\,(\hat{F}^{(m-1)})^2}$ — the **Hessian**
+-   $\Omega(f_m) = \gamma T + \dfrac{\lambda}{2}\sum_{j=1}^{T} w_j^2 + \alpha\sum_j|w_j|$ — **regularisation** on tree complexity
+
+Given a tree structure, the **optimal weight** for leaf $j$ is:
+
+$$w_j^* = -\frac{\sum_{i \in \text{leaf}_j} g_i}{\sum_{i \in \text{leaf}_j} h_i + \lambda}$$
+
+### 3.4 LightGBM vs. XGBoost
+
+```{r lgb-vs-xgb, echo=FALSE}
+compare_tbl <- data.frame(
+  Aspect = c("Tree growth", "Split finding", "Categorical features",
+             "Missing values", "Key tuning parameters"),
+  LightGBM = c(
+    "Leaf-wise: always expands the leaf with the highest gain",
+    "Histogram-based: continuous features are bucketed",
+    "Native support; passed as integer-encoded categories",
+    "Learns the optimal branch direction during training",
+    "num_leaves, min_data_in_leaf, bagging_fraction, feature_fraction, lambda_l1, lambda_l2"
+  ),
+  XGBoost = c(
+    "Depth-wise: expands all leaves at the same depth before going deeper",
+    "Histogram-based (tree_method = 'hist')",
+    "Native support via feature_types = 'c'",
+    "Learns the optimal branch direction during training",
+    "max_depth, min_child_weight, subsample, colsample_bytree, lambda, alpha, gamma"
+  )
+)
+
+kable(compare_tbl, align = c("l","l","l"), booktabs = TRUE,
+      col.names = c("Aspect", "LightGBM", "XGBoost"),
+      caption = "Key differences between LightGBM and XGBoost") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = TRUE) %>%
+  column_spec(1, bold = TRUE, width = "4.5cm")
+```
+
+### 3.5 Application to the Dataset
+
+**LightGBM — three hyperparameter configurations** (`lgb_tuned`, `lgb_tuned2`, `lgb_tuned3`) were obtained by Optuna-based Bayesian hyperparameter search. They differ mainly in learning rate, number of leaves, and regularisation strength.
+
+**XGBoost — four configurations** (`xgb_tuned`, `xgb_tuned2`, `xgb_tuned3`, `xgb_deep`). The `xgb_deep` variant uses a larger `max_depth = 7` to capture higher-order feature interactions.
+
+In both frameworks, categorical features — gender, insurance card type, occupation code, marital status, and interaction features such as age-group × gender — are passed as native categoricals. Household ID prefixes of varying length (2 to 11 characters) serve as geographic proxy variables.
+
+Early stopping (patience = 500 rounds for LightGBM, 400 rounds for XGBoost) halts training when the validation loss stops improving.
+
+### 3.6 Validation Errors — LightGBM
+
+```{r lgb-results, echo=FALSE}
+lgb_fold_tbl <- data.frame(
+  Model      = c("lgb_tuned", "lgb_tuned2", "lgb_tuned3", "lgb_hurdle"),
+  Fold1  = c(2.342128, 2.341244, 2.333742, 2.393922),
+  Fold2  = c(2.283862, 2.282513, 2.288554, 2.359690),
+  Fold3  = c(2.272713, 2.276316, 2.261939, 2.351681),
+  Fold4  = c(2.287600, 2.290573, 2.291300, 2.375751),
+  Fold5  = c(2.273407, 2.282491, 2.263095, 2.357679),
+  Fold6  = c(2.328391, 2.329930, 2.318743, 2.379764),
+  Fold7  = c(2.303784, 2.302809, 2.299462, 2.384093),
+  Fold8  = c(2.279125, 2.285029, 2.276929, 2.365256),
+  Fold9  = c(2.262505, 2.264468, 2.263080, 2.365438),
+  Fold10 = c(2.269223, 2.267331, 2.256790, 2.374023),
+  `OOF RMSE` = c(2.290417, 2.292404, 2.285505, 2.370762),
+  check.names = FALSE
+)
+
+kable(lgb_fold_tbl, digits = 4, align = c("l", rep("c", 11)),
+      booktabs = TRUE,
+      caption = "LightGBM per-fold and overall OOF RMSE (10-fold stratified CV)") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"),
+                full_width = TRUE, font_size = 11) %>%
+  column_spec(1, bold = TRUE, width = "3.5cm") %>%
+  column_spec(12, bold = TRUE)
+
+lgb_blend_tbl <- data.frame(
+  Method = c("LGB Blend (softmax-weighted)", "LGB Blend + Power Calibration"),
+  `OOF RMSE` = c(2.281675, 2.281100),
+  check.names = FALSE
+)
+kable(lgb_blend_tbl, digits = 6, align = c("l","c"), booktabs = TRUE,
+      caption = "LightGBM ensemble OOF RMSE") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"),
+                full_width = FALSE, position = "left") %>%
+  column_spec(2, bold = TRUE, width = "3.5cm")
+```
+
+### 3.7 Validation Errors — XGBoost
+
+```{r xgb-results, echo=FALSE}
+xgb_fold_tbl <- data.frame(
+  Model  = c("xgb_tuned", "xgb_tuned2", "xgb_tuned3", "xgb_deep", "xgb_hurdle"),
+  Fold1  = c(2.338964, 2.334449, 2.343382, 2.340620, 2.337424),
+  Fold2  = c(2.287389, 2.277720, 2.295051, 2.300116, 2.297058),
+  Fold3  = c(2.269065, 2.259685, 2.277618, 2.267822, 2.282326),
+  Fold4  = c(2.309799, 2.298371, 2.316769, 2.294416, 2.296888),
+  Fold5  = c(2.274798, 2.270528, 2.283607, 2.264273, 2.291344),
+  Fold6  = c(2.323620, 2.324425, 2.334569, 2.338196, 2.317403),
+  Fold7  = c(2.293821, 2.287411, 2.305580, 2.292225, 2.287160),
+  Fold8  = c(2.284666, 2.280033, 2.295237, 2.289328, 2.279924),
+  Fold9  = c(2.274670, 2.276088, 2.280854, 2.267825, 2.272957),
+  Fold10 = c(2.296094, 2.288234, 2.289292, 2.292930, 2.271447),
+  `OOF RMSE` = c(2.295390, 2.289804, 2.302301, 2.294917, 2.293481),
+  check.names = FALSE
+)
+
+kable(xgb_fold_tbl, digits = 4, align = c("l", rep("c", 11)),
+      booktabs = TRUE,
+      caption = "XGBoost per-fold and overall OOF RMSE (10-fold stratified CV)") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"),
+                full_width = TRUE, font_size = 11) %>%
+  column_spec(1, bold = TRUE, width = "3.5cm") %>%
+  column_spec(12, bold = TRUE)
+
+xgb_blend_tbl <- data.frame(
+  Method = c("XGB Blend (softmax-weighted)", "XGB Blend + Power Calibration"),
+  `OOF RMSE` = c(2.277583, 2.277481),
+  check.names = FALSE
+)
+kable(xgb_blend_tbl, digits = 6, align = c("l","c"), booktabs = TRUE,
+      caption = "XGBoost ensemble OOF RMSE") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"),
+                full_width = FALSE, position = "left") %>%
+  column_spec(2, bold = TRUE, width = "3.5cm")
+```
+
+------------------------------------------------------------------------
+
+## 4. Hurdle Model Variant
+
+Both LightGBM and XGBoost were also trained as **hurdle models** (`lgb_hurdle`, `xgb_hurdle`). The hurdle model is motivated by the structure of the data: only **18.3%** of individuals have any healthcare cost. A single regression model must simultaneously learn two things — whether someone incurs any cost at all, and how large that cost will be. A hurdle model separates these into two dedicated sub-models.
+
+### 4.1 Definition and Intuition
+
+A hurdle model asks two questions sequentially:
+
+1.  **Will the individual have any cost?** — answered by a binary classifier.
+2.  **Given that there is a cost, how large will it be?** — answered by a regression model trained only on positive-cost observations.
+
+The final prediction multiplies the two outputs.
+
+### 4.2 Math
+
+Using the law of total expectation:
+
+$$E[y_i] = P(y_i > 0)\times E[y_i \mid y_i > 0] + P(y_i = 0)\times 0
+         = P(y_i > 0)\times E[y_i \mid y_i > 0]$$
+
+The hurdle model estimates each term separately:
+
+$$\hat{y}_i = \underbrace{\hat{p}_i}_{P(y_i>0\mid\mathbf{x}_i)} \times
+              \underbrace{\hat{\mu}_i}_{E[y_i \mid y_i>0,\,\mathbf{x}_i]}$$
+
+**Stage 1 — Binary classifier** trained on the full dataset with label $y_i^{\text{bin}} = \mathbf{1}[y_i > 0]$ using binary cross-entropy loss:
+
+$$\ell_{\text{cls}} = -\bigl[y_i^{\text{bin}}\log\hat{p}_i + (1-y_i^{\text{bin}})\log(1-\hat{p}_i)\bigr]$$
+
+**Stage 2 — Regression on positive observations** trained only on the $n^+ = 4{,}748$ individuals with $y_i > 0$ (18.3% of 25,873):
+
+$$\ell_{\text{reg}} = \tfrac{1}{2}(y_i - \hat{\mu}_i)^2, \quad
+\text{for } i \text{ with } y_i > 0$$
+
+### 4.3 Validation
+
+Same 10-fold stratified CV. The hurdle OOF RMSE is included in the model comparison tables above. The hurdle model performs comparably to the pure regression variants, providing complementary diversity rather than a clear accuracy advantage on its own.
+
+------------------------------------------------------------------------
+
+## 5. Stage 3 — Softmax Ensemble Blend
+
+### 5.1 Intuition
+
+After training 9 individual models (3 LGB + 1 LGB hurdle + 4 XGB + 1 XGB hurdle), we combine them into a single prediction. **Softmax blending** finds the combination that minimises OOF validation error, assigning higher weight to better models while guaranteeing that all weights are positive and sum to one.
+
+### 5.2 Math
+
+The blended prediction is a weighted average:
+
+$$\hat{y}^{\text{blend}} = \sum_{k=1}^{K} w_k\,\hat{y}^{(k)}, \qquad
+w_k = \frac{e^{z_k}}{\displaystyle\sum_{j=1}^{K} e^{z_j}}$$
+
+The free parameters $z_1,\ldots,z_K$ are found by minimising the OOF RMSE:
+
+$$\underset{z_1,\ldots,z_K}{\min}\;\;
+\text{RMSE}\!\left(\sum_{k=1}^{K} w_k(z)\,\hat{y}^{\text{OOF},(k)},\; y\right)$$
+
+### 5.3 Application and Validation
+
+An optional **power-law calibration** $\hat{y} \mapsto a\,(\hat{y})^c + b$ is applied after blending if it reduces the cross-validated RMSE.
+
+```{r blend-results, echo=FALSE}
+blend_val <- data.frame(
+  Method     = c("Softmax blend of all 9 LGB + XGB outputs",
+                 "Softmax blend + Power Calibration (applied)"),
+  `OOF RMSE` = c(2.270902, 2.270563),
+  check.names = FALSE
+)
+kable(blend_val, digits = 6, align = c("l","c"), booktabs = TRUE,
+      caption = "Stage 3 — Softmax blend validation errors") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"),
+                full_width = FALSE, position = "left") %>%
+  column_spec(2, bold = TRUE, width = "3.5cm")
+```
+
+The blend reduces OOF RMSE from the best individual model (2.2778) to **2.2706**, confirming that LightGBM and XGBoost capture different patterns in the data and benefit from being combined.
+
+------------------------------------------------------------------------
+
+## 6. Stage 4 — Ridge Meta-Stacking
+
+### 6.1 Intuition
+
+**Stacking** trains a second-level model (the **meta-learner**) on the OOF predictions of the base models. We choose **Ridge regression** as the meta-learner because it is simple, interpretable, and the regularisation prevents over-relying on any single base model when the predictions are highly correlated.
+
+### 6.2 Math
+
+Let $\{X} \in \mathbb{R}^{n \times K}$ be the matrix of OOF predictions from all $K$ base models and $\mathbf{y}$ the true targets. Ridge regression finds:
+
+$$\hat{\boldsymbol{\beta}} = \underset{\boldsymbol{\beta}}{arg min}\;
+\|\mathbf{y} - \mathbf{X}\boldsymbol{\beta}\|^2 + \lambda\|\boldsymbol{\beta}\|^2$$
+
+with the closed-form solution:
+
+$$\hat{\boldsymbol{\beta}} = (\mathbf{X}^\top\mathbf{X} + \lambda\mathbf{I})^{-1}\mathbf{X}^\top\mathbf{y}$$
+
+The meta-prediction is:
+
+$$\hat{y}^{\text{meta}} = \hat{\beta}_0 + \sum_{k=1}^{K} \hat{\beta}_k\,\hat{y}^{\text{OOF},(k)}$$
+
+### 6.3 Application to the Dataset
+
+We searched over four subsets of base model columns and 17 values of $\lambda$ from $10^{-6}$ to $30$.
+
+The best configuration found was:
+
+-   **Column set:** all 12 base outputs (all individual models + their blends)
+-   **Best** $\lambda$: 0.003
+-   **CV RMSE:** 2.2691
+
+### 6.4 Validation Error
+
+```{r ridge-results, echo=FALSE}
+ridge_val <- data.frame(
+  Configuration = c("Ridge meta-learner (set = all, λ = 0.003)",
+                    "Power Calibration (not applied — no improvement)"),
+  `CV RMSE`     = c(2.269132, "—"),
+  `In-sample RMSE` = c(2.268166, "—"),
+  check.names = FALSE
+)
+kable(ridge_val, align = c("l","c","c"), booktabs = TRUE,
+      caption = "Stage 4 — Ridge meta-stacking validation errors") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"),
+                full_width = FALSE, position = "left") %>%
+  column_spec(2, bold = TRUE, width = "3.5cm")
+```
+
+------------------------------------------------------------------------
+
+## 7. Stage 5 — Residual Correction
+
+### 7.1 Intuition
+
+Even after meta-stacking, there may be **systematic patterns in the prediction errors** that a linear model cannot capture. The residual correction stage trains a simple model on these leftover errors.
+
+### 7.2 Math
+
+Let $\hat{y}^{\text{base}}$ be the Ridge meta prediction from Stage 4. We define:
+
+$$\varepsilon_i = y_i - \hat{y}^{\text{base}}_i$$
+
+A shallow, heavily regularised XGBoost predicts $\varepsilon_i$ from the original features. The corrected final prediction is:
+
+$$\hat{y}^{\text{final}} = \hat{y}^{\text{base}} + s \cdot \hat{\varepsilon}$$
+
+where $s$ is a **shrinkage factor** found by grid search over $s \in [-0.3,\; 1.8]$. Residuals are clipped to $[-1.5,\; 1.5]$ before training.
+
+Three residual XGBoost configurations were tested:
+
+```{r resid-configs, echo=FALSE}
+resid_cfg <- data.frame(
+  Config          = c("resid_base", "resid_mid", "resid_smooth"),
+  `Max depth`     = c(3, 4, 3),
+  `Learning rate` = c(0.0001, 0.025, 0.012),
+  `Min child wt`  = c(60, 60, 120),
+  `λ (L2)`        = c(12, 8, 18),
+  `α (L1)`        = c(2, 1, 3),
+  check.names = FALSE
+)
+kable(resid_cfg, align = c("l","c","c","c","c","c"), booktabs = TRUE,
+      caption = "Residual XGBoost configurations — all are intentionally shallow and heavily regularised") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"),
+                full_width = FALSE, position = "left") %>%
+  column_spec(1, bold = TRUE)
+```
+
+### 7.3 Validation Error
+
+```{r v4-results, echo=FALSE}
+v4_fold_tbl <- data.frame(
+  Config  = c("resid_smooth", "resid_base", "resid_mid"),
+  Fold1   = c(2.297970, 2.298276, 2.298165),
+  Fold2   = c(2.250062, 2.250049, 2.250384),
+  Fold3   = c(2.242448, 2.243129, 2.242759),
+  Fold4   = c(2.321898, 2.321828, 2.322267),
+  Fold5   = c(2.255557, 2.255491, 2.256017),
+  Fold6   = c(2.289946, 2.290107, 2.290476),
+  Fold7   = c(2.291757, 2.291862, 2.291897),
+  Fold8   = c(2.272872, 2.272810, 2.273252),
+  Fold9   = c(2.239058, 2.239110, 2.239167),
+  Fold10  = c(2.229695, 2.230611, 2.230388),
+  `OOF RMSE` = c(2.269319, 2.269489, 2.269489),
+  check.names = FALSE
+)
+kable(v4_fold_tbl, digits = 4, align = c("l", rep("c", 11)),
+      booktabs = TRUE,
+      caption = "Stage 5 — Residual correction per-fold RMSE (with shrinkage applied)") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"),
+                full_width = TRUE, font_size = 11) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(12, bold = TRUE) %>%
+  row_spec(1, background = "#eaf4fb")
+
+v4_summary <- data.frame(
+  Stage       = c("V3 base (cross-fit RMSE, input to Stage 5)",
+                  "V4 best: resid_smooth, shrinkage s = 1.04",
+                  "Power Calibration (not applied — no improvement)"),
+  `CV RMSE`   = c(2.269489, 2.269319, "—"),
+  check.names = FALSE
+)
+kable(v4_summary, align = c("l","c"), booktabs = TRUE,
+      caption = "Stage 5 — Residual correction final summary") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"),
+                full_width = FALSE, position = "left") %>%
+  column_spec(2, bold = TRUE, width = "3.5cm") %>%
+  row_spec(2, bold = TRUE, background = "#eaf4fb")
+```
+
+The `resid_smooth` configuration with shrinkage $s = 1.04$ gives a competitive residual-corrected candidate. In the final comparison table, the Ridge meta-stacking stage has the lowest internal OOF RMSE, while the residual-corrected model is retained as an additional Kaggle submission candidate because it directly targets remaining prediction errors.
+
+------------------------------------------------------------------------
+
+## 8. Summary
+
+```{r final-summary, echo=FALSE}
+summary_val <- data.frame(
+  Stage      = c(
+    "LGB Blend", "LGB Blend + PowerCal",
+    "XGB Blend", "XGB Blend + PowerCal",
+    "Stage 3: Softmax Blend (LGB + XGB + PowerCal)",
+    "Stage 4: Ridge Meta-Stacking",
+    "Stage 5: Residual Correction (resid_smooth, s = 1.04)"
+  ),
+  `OOF RMSE` = c(
+    2.281675, 2.281100,
+    2.277583, 2.277481,
+    2.270563,
+    2.269132,
+    2.269319
+  ),
+  Note = c(
+    "", "", "", "",
+    "Power calibration applied",
+    "Best internal OOF RMSE; CV-selected model",
+    "Residual-corrected submission candidate"
+  ),
+  check.names = FALSE
+)
+
+kable(summary_val, digits = 6, align = c("l","c","l"), booktabs = TRUE,
+      caption = "Full pipeline OOF RMSE comparison") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  column_spec(2, bold = TRUE, width = "3cm") %>%
+  row_spec(6, bold = TRUE, background = "#eaf4fb") %>%
+  pack_rows("LightGBM base", 1, 2) %>%
+  pack_rows("XGBoost base", 3, 4) %>%
+  pack_rows("Ensemble stages", 5, 7)
+```
+
+The largest single improvement comes from moving from individual models to blending (Stage 3), where combining diverse LGB and XGB outputs reduces error more than any single model can. The Ridge meta-learner (Stage 4) provides the best internal OOF RMSE in this run. The residual correction stage remains useful as a robustness check and as an alternative Kaggle candidate, but it is not claimed to dominate Stage 4 by OOF RMSE.
+
+## 9. Kaggle Submission
+
+The Kaggle submission file follows the required sample format with two columns:
+
+- `ID`: individual identifier from the test set.
+- `y.hat`: predicted log-transformed annual healthcare cost.
+
+The main CV-selected submission is the Ridge meta-stacking output from Stage 4, because it achieves the lowest OOF RMSE in this report. The residual-corrected Stage 5 file is an additional candidate that may perform differently on the public leaderboard because the leaderboard split is not identical to the internal cross-validation folds.
+
+## 10. Conclusion and Limitations
+
+This project predicts annual healthcare cost on the log scale using a staged ensemble of LightGBM, XGBoost, softmax blending, ridge meta-stacking, and residual correction. The data has strong zero-inflation, heavy right skew, and structurally missing income variables, making tree-based models more suitable than simple linear models.
+
+The best internal validation result is obtained by the Ridge meta-learner. The key limitation is that public Kaggle performance can differ from OOF RMSE because of split variation, especially in a highly sparse healthcare-cost target. Future improvements could include seed ensembling, more stable fold averaging, and targeted calibration for high-cost individuals.

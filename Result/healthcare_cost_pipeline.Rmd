@@ -1,0 +1,1340 @@
+---
+title: "Healthcare Cost Prediction Pipeline"
+subtitle: "LightGBM + XGBoost → Blend → Ridge Meta → Residual Correction"
+author: "Son"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache   = TRUE   # set TRUE to cache heavy training chunks across re-runs
+)
+```
+
+# Overview
+
+This notebook reproduces the full pipeline in order:
+
+| Step | Script origin | Output |
+|------|--------------|--------|
+| 1 | `optimize_healthcare_costs.R` | LightGBM OOF + test predictions |
+| 2 | `optimize_healthcare_costs_xgboost.R` | XGBoost OOF + test predictions |
+| 3 | `blend_lgb_xgb_son_flow.R` | Softmax-blended submission |
+| 4 | `optimize_xgb_enhanced_v3_ridge_meta.R` | Ridge meta-stacked submission |
+| 5 | `optimize_xgb_enhanced_v4_residual.R` | Residual-corrected final submission |
+
+> **Latest recommended submission:** `submissions_xgb/submission_xgb_enhanced_v4_residual.csv`
+
+---
+
+# ⚙️ Global Configuration
+
+> **Parameters you are most likely to change are flagged with `# <<TUNE>>`.**
+> Parameters that are safe to leave at their defaults are marked `# <<FIXED>>`.
+
+```{r global-config}
+# ── Reproducibility ──────────────────────────────────────────────────────────
+RANDOM_SEED <- 20051710L          # <<TUNE>> change to get a different random split
+
+# ── File paths ───────────────────────────────────────────────────────────────
+TRAIN_PATH  <- "train.csv"        # <<TUNE>> path to training data
+TEST_PATH   <- "test.csv"         # <<TUNE>> path to test data
+SAMPLE_PATH <- "sample_submission.csv"  # <<FIXED>>
+
+# ── Output directories ────────────────────────────────────────────────────────
+OUT_DIR_LGB <- "submissions"      # <<FIXED>> LightGBM outputs land here
+OUT_DIR_XGB <- "submissions_xgb"  # <<FIXED>> XGBoost / blend / v3 / v4 outputs land here
+
+# ── Cross-validation ─────────────────────────────────────────────────────────
+N_FOLDS <- 10L                     # <<TUNE>> 4–6 is typical; more folds = more runtime
+
+# ── Column names (do not change unless your data has different column names) ──
+TARGET         <- "y"             # <<FIXED>>
+ID_COL         <- "ID"            # <<FIXED>>
+SUBMISSION_COL <- "y.hat"         # <<FIXED>>
+NA_CHR         <- "__NA__"        # <<FIXED>> sentinel for missing categoricals
+
+# ── Prediction clipping ───────────────────────────────────────────────────────
+PRED_MIN <- 0.0                   # <<FIXED>>
+PRED_MAX <- 15.0                  # <<FIXED>>
+
+# ── Residual clipping (v4 stage) ──────────────────────────────────────────────
+RESID_CLIP <- 1.5                 # <<TUNE>> controls how aggressively residuals are
+                                  #   clamped; lower = more conservative correction
+
+# ── Parallelism ───────────────────────────────────────────────────────────────
+NUM_THREADS <- max(1L, parallel::detectCores(logical = TRUE) - 1L)
+                                  # <<TUNE>> hard-code an integer if you want to
+                                  #   limit CPU usage, e.g. NUM_THREADS <- 4L
+# ── Log file ────────────────────────────────────────────────────────────────
+LOG_FILE <- file.path(OUT_DIR_XGB, "pipeline_log.txt")
+if (!file.exists(LOG_FILE)) file.create(LOG_FILE)
+sink(LOG_FILE, append = TRUE, split = TRUE)
+cat("\n========== NEW RUN ==========\n")
+cat("Started at:", as.character(Sys.time()), "\n")
+
+```
+
+---
+
+# 📦 Libraries
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(lightgbm)
+  library(xgboost)
+  library(jsonlite)
+})
+```
+
+---
+
+# 🛠️ Shared Utilities
+
+Helper functions used by every pipeline stage.
+
+```{r utils}
+rmse <- function(pred, y) sqrt(mean((pred - y)^2))
+
+clip_pred <- function(pred) pmin(pmax(pred, PRED_MIN), PRED_MAX)
+
+clip_residual <- function(x, limit = RESID_CLIP) pmin(pmax(x, -limit), limit)
+
+cat_value <- function(x) {
+  out <- as.character(x)
+  out[is.na(out)] <- NA_CHR
+  out
+}
+
+safe_row_sum <- function(dt, cols) {
+  cols <- intersect(cols, names(dt))
+  if (length(cols) == 0L) return(rep(0.0, nrow(dt)))
+  rowSums(as.data.frame(dt[, ..cols]), na.rm = TRUE)
+}
+
+safe_mean <- function(x) { v <- as.numeric(x[!is.na(x)]); if (!length(v)) NA_real_ else mean(v) }
+safe_min  <- function(x) { v <- as.numeric(x[!is.na(x)]); if (!length(v)) NA_real_ else min(v) }
+safe_max  <- function(x) { v <- as.numeric(x[!is.na(x)]); if (!length(v)) NA_real_ else max(v) }
+safe_sd   <- function(x) { v <- as.numeric(x[!is.na(x)]); if (length(v) <= 1L) 0.0 else sd(v) }
+```
+
+---
+
+# 📐 Column Definitions
+
+```{r column-definitions}
+AUX_TARGETS <- c("FRE_NGOAITRU", "FRE_NOITRU", "COST_NGOAITRU", "COST_NOITRU", TARGET)
+
+CODE_CATEGORICAL_COLS <- c(
+  "GENDER", "MARRIED_STATUS", "HOC_DEN_LOP_MAY", "HOC_VAN_SAU_DAI_HOC",
+  "CO_THE_BAO_HIEM", "LOAI_THE_1", "LOAI_THE_2", "CO_LAM_VIEC",
+  "CO_DUOC_KY_HOP_DONG", "CO_CONG_VIEC_THU_HAI", "CO_DUOC_KY_HOP_DONG_2"
+)
+
+MONEY_COLS <- c(
+  "TIEN_LUONG_12T", "TIEN_LE_TET", "THUONG_PHU_CAP",
+  "LUONG_CONG_VIEC_2", "TIEN_LE_TET_2", "THUONG_PHU_CAP_2",
+  "LUONG_CONG_VIEC_3", "TIEN_TRO_CAP_THAT_NGHIEP",
+  "TIEN_TRO_CAP_THOI_VIEC_1_LAN", "LUONG_CHO_NGHI_HUU_BINH_THUONG",
+  "LUONG_CHO_NGHI_HUU_SOM", "TRO_CAP_MAT_SUC_LAO_DONG"
+)
+```
+
+---
+
+# 📂 Data Loading
+
+```{r load-data}
+train  <- fread(TRAIN_PATH,  integer64 = "numeric")
+test   <- fread(TEST_PATH,   integer64 = "numeric")
+sample <- fread(SAMPLE_PATH, integer64 = "numeric")
+
+y         <- as.numeric(train[[TARGET]])
+train_ids <- as.character(train[[ID_COL]])
+
+cost_sum  <- fifelse(is.na(train$COST_NGOAITRU), 0.0, train$COST_NGOAITRU) +
+             fifelse(is.na(train$COST_NOITRU),   0.0, train$COST_NOITRU)
+max_delta <- max(abs(y - log1p(cost_sum)))
+
+cat(sprintf("Train rows : %d\n",        nrow(train)))
+cat(sprintf("Test rows  : %d\n",        nrow(test)))
+cat(sprintf("Positive rate : %.4f\n",   mean(y > 0)))
+cat(sprintf("Target sanity (max |y - log1p(cost_sum)|) = %.3e\n", max_delta))
+```
+
+---
+
+# 🔨 Feature Engineering
+
+## ID Parsing & Base Features
+
+```{r feature-engineering}
+split_id_df <- function(df) {
+  out   <- copy(as.data.table(df))
+  parts <- tstrsplit(as.character(out[[ID_COL]]), "_", fixed = TRUE, keep = 1:2)
+  out[, hh := parts[[1L]]]
+  out[, member_idx := suppressWarnings(as.integer(parts[[2L]]))]
+  for (n in c(2L, 3L, 4L, 5L, 6L, 8L, 11L)) {
+    out[, paste0("hh_pref", n) := substr(hh, 1L, n)]
+  }
+  out[, member_idx_cat := fifelse(is.na(member_idx), NA_CHR, as.character(member_idx))]
+  out
+}
+
+add_base_features <- function(train, test) {
+  feature_cols  <- setdiff(names(train), AUX_TARGETS)
+  train_part    <- copy(train[, ..feature_cols])[, is_train_flag := 1L]
+  test_part     <- copy(test[,  ..feature_cols])[, is_train_flag := 0L]
+  all_dt        <- rbindlist(list(train_part, test_part), use.names = TRUE, fill = TRUE)
+  all_dt        <- split_id_df(all_dt)
+
+  # ── Age features ────────────────────────────────────────────────────────────
+  # <<TUNE>> age bin breakpoints below — adjust if domain knowledge changes
+  all_dt[, AGE2        := AGE^2]
+  all_dt[, AGE_log1p   := log1p(AGE)]
+  all_dt[, is_child    := as.integer(AGE < 15)]
+  all_dt[, is_working_age := as.integer(AGE >= 15 & AGE <= 64)]
+  all_dt[, is_elder    := as.integer(AGE >= 60)]
+  all_dt[, age_bin := as.character(cut(
+    AGE,
+    breaks = c(-1, 5, 12, 18, 30, 45, 60, 75, 200),   # <<TUNE>>
+    labels = c("00_05","06_12","13_18","19_30","31_45","46_60","61_75","76p"),
+    include.lowest = TRUE
+  ))]
+  all_dt[is.na(age_bin), age_bin := NA_CHR]
+
+  # ── Money features ───────────────────────────────────────────────────────────
+  money_existing <- intersect(MONEY_COLS, names(all_dt))
+  for (col in money_existing) {
+    raw <- all_dt[[col]]
+    z   <- fifelse(is.na(raw), 0.0, as.numeric(raw))
+    all_dt[, paste0(col, "_missing") := as.integer(is.na(raw))]
+    all_dt[, paste0(col, "_zero")    := z]
+    all_dt[, paste0(col, "_log1p")   := log1p(pmax(z, 0.0))]
+  }
+  zero_cols <- paste0(money_existing, "_zero")
+  all_dt[, income_total       := safe_row_sum(.SD, zero_cols), .SDcols = names(all_dt)]
+  all_dt[, income_total_log1p := log1p(pmax(income_total, 0.0))]
+  all_dt[, income_job1 := safe_row_sum(.SD, c("TIEN_LUONG_12T","TIEN_LE_TET","THUONG_PHU_CAP")),    .SDcols = names(all_dt)]
+  all_dt[, income_job2 := safe_row_sum(.SD, c("LUONG_CONG_VIEC_2","TIEN_LE_TET_2","THUONG_PHU_CAP_2")), .SDcols = names(all_dt)]
+  all_dt[, income_job3 := fifelse(is.na(LUONG_CONG_VIEC_3), 0.0, as.numeric(LUONG_CONG_VIEC_3))]
+  for (col in c("income_job1","income_job2","income_job3")) {
+    all_dt[, paste0(col,"_log1p") := log1p(pmax(get(col), 0.0))]
+  }
+  all_dt[, has_any_income        := as.integer(income_total > 0)]
+  all_dt[, has_second_job_income := as.integer(income_job2  > 0)]
+  all_dt[, has_third_job_income  := as.integer(income_job3  > 0)]
+
+  # ── Categoricals ─────────────────────────────────────────────────────────────
+  cat_cols <- c("hh","member_idx_cat", paste0("hh_pref", c(2L,3L,4L,5L,6L,8L,11L)))
+  for (col in CODE_CATEGORICAL_COLS) {
+    if (col %in% names(all_dt)) {
+      new_col <- paste0(col, "_cat")
+      all_dt[, (new_col) := cat_value(get(col))]
+      cat_cols <- c(cat_cols, new_col)
+    }
+  }
+  for (col in c("MA_NGHE_NGHIEP","MA_NGHE_2")) {
+    if (col %in% names(all_dt)) { all_dt[, (col) := cat_value(get(col))]; cat_cols <- c(cat_cols, col) }
+  }
+
+  # ── Interaction features ──────────────────────────────────────────────────────
+  all_dt[, agebin_gender  := paste(cat_value(age_bin),       cat_value(GENDER),          sep = "__")]
+  all_dt[, job_work       := paste(cat_value(MA_NGHE_NGHIEP),cat_value(CO_LAM_VIEC),     sep = "__")]
+  all_dt[, insurance_card := paste(cat_value(CO_THE_BAO_HIEM),cat_value(LOAI_THE_1),     sep = "__")]
+  all_dt[, geo_agebin     := paste(cat_value(hh_pref5),      cat_value(age_bin),         sep = "__")]
+  cat_cols <- c(cat_cols, "age_bin","agebin_gender","job_work","insurance_card","geo_agebin")
+
+  # ── Household-level aggregates ────────────────────────────────────────────────
+  all_dt[, hh_size_all    := .N,                              by = hh]
+  all_dt[, hh_train_count := sum(is_train_flag),              by = hh]
+  all_dt[, hh_test_count  := hh_size_all - hh_train_count]
+  for (col in intersect(c("AGE","income_total","HOC_DEN_LOP_MAY","HOC_VAN_SAU_DAI_HOC"), names(all_dt))) {
+    all_dt[, paste0("hh_",col,"_mean") := safe_mean(get(col)), by = hh]
+    all_dt[, paste0("hh_",col,"_min")  := safe_min(get(col)),  by = hh]
+    all_dt[, paste0("hh_",col,"_max")  := safe_max(get(col)),  by = hh]
+    all_dt[, paste0("hh_",col,"_std")  := safe_sd(get(col)),   by = hh]
+  }
+  for (col in intersect(c("is_child","is_elder","has_any_income","CO_THE_BAO_HIEM"), names(all_dt))) {
+    sum_col  <- paste0("hh_",col,"_sum")
+    rate_col <- paste0("hh_",col,"_rate")
+    all_dt[, (sum_col)  := sum(get(col), na.rm = TRUE), by = hh]
+    all_dt[, (rate_col) := get(sum_col) / pmax(hh_size_all, 1L)]
+  }
+  all_dt[, hh_female_count      := sum(GENDER == 2, na.rm = TRUE),   by = hh]
+  all_dt[, hh_male_count        := sum(GENDER == 1, na.rm = TRUE),   by = hh]
+  all_dt[, age_minus_hh_mean    := AGE - hh_AGE_mean]
+  all_dt[, age_over_hh_max      := AGE / fifelse(hh_AGE_max == 0, NA_real_, hh_AGE_max)]
+  all_dt[, hh_income_total_sum_tmp := sum(income_total, na.rm = TRUE), by = hh]
+  all_dt[, income_share_hh      := income_total / fifelse(hh_income_total_sum_tmp == 0, NA_real_, hh_income_total_sum_tmp)]
+  all_dt[is.na(income_share_hh), income_share_hh := 0.0]
+  all_dt[, hh_income_total_sum_tmp := NULL]
+  all_dt[, age_rank_oldest   := frank(-AGE,  ties.method = "first", na.last = "keep"), by = hh]
+  all_dt[, age_rank_youngest := frank( AGE,  ties.method = "first", na.last = "keep"), by = hh]
+  all_dt[, is_oldest_in_hh   := as.integer(age_rank_oldest  == 1)]
+  all_dt[, is_youngest_in_hh := as.integer(age_rank_youngest == 1)]
+  all_dt[, member_idx_over_hh_size := as.numeric(member_idx) / pmax(hh_size_all, 1L)]
+
+  train_base <- copy(all_dt[is_train_flag == 1L])[, is_train_flag := NULL]
+  test_base  <- copy(all_dt[is_train_flag == 0L])[, is_train_flag := NULL]
+  cat_cols   <- sort(unique(cat_cols[cat_cols %in% names(train_base)]))
+  list(train_base = train_base, test_base = test_base, cat_cols = cat_cols)
+}
+```
+
+## Target Encoding Helpers
+
+```{r target-encoding}
+global_target_defaults <- function(source) {
+  y_src     <- as.numeric(source[[TARGET]])
+  pos       <- y_src > 0
+  cost_tot  <- fifelse(is.na(source$COST_NGOAITRU), 0.0, source$COST_NGOAITRU) +
+               fifelse(is.na(source$COST_NOITRU),   0.0, source$COST_NOITRU)
+  freq_tot  <- fifelse(is.na(source$FRE_NGOAITRU),  0.0, source$FRE_NGOAITRU) +
+               fifelse(is.na(source$FRE_NOITRU),    0.0, source$FRE_NOITRU)
+  list(
+    hh_tgt_count = 0.0,
+    hh_tgt_y_mean = mean(y_src),
+    hh_tgt_y_sum  = 0.0,
+    hh_tgt_y_max  = mean(y_src),
+    hh_tgt_y_min  = mean(y_src),
+    hh_tgt_y_std  = 0.0,
+    hh_tgt_pos_count    = 0.0,
+    hh_tgt_pos_rate     = mean(pos),
+    hh_tgt_pos_y_mean   = if (any(pos)) mean(y_src[pos]) else mean(y_src),
+    hh_tgt_cost_sum_log1p  = 0.0,
+    hh_tgt_cost_mean_log1p = log1p(mean(cost_tot)),
+    hh_tgt_freq_sum  = 0.0,
+    hh_tgt_freq_mean = mean(freq_tot)
+  )
+}
+
+aggregate_target_features <- function(source) {
+  src <- copy(source[, c("hh", AUX_TARGETS), with = FALSE])
+  src[, cost_total := fifelse(is.na(COST_NGOAITRU),0.0,COST_NGOAITRU)+fifelse(is.na(COST_NOITRU),0.0,COST_NOITRU)]
+  src[, freq_total := fifelse(is.na(FRE_NGOAITRU), 0.0,FRE_NGOAITRU) +fifelse(is.na(FRE_NOITRU), 0.0,FRE_NOITRU)]
+  src[, pos   := as.numeric(get(TARGET) > 0)]
+  src[, pos_y := get(TARGET) * pos]
+
+  stats <- src[, .(
+    hh_tgt_count      = .N,
+    hh_tgt_y_mean     = mean(get(TARGET)),
+    hh_tgt_y_sum      = sum(get(TARGET)),
+    hh_tgt_y_max      = max(get(TARGET)),
+    hh_tgt_y_min      = min(get(TARGET)),
+    hh_tgt_y_std      = if (.N<=1L) 0.0 else sd(get(TARGET)),
+    hh_tgt_pos_count  = sum(pos),
+    hh_tgt_pos_rate   = mean(pos),
+    hh_tgt_pos_y_sum  = sum(pos_y),
+    hh_tgt_cost_sum   = sum(cost_total),
+    hh_tgt_cost_mean  = mean(cost_total),
+    hh_tgt_freq_sum   = sum(freq_total),
+    hh_tgt_freq_mean  = mean(freq_total)
+  ), by = hh]
+
+  defaults <- global_target_defaults(source)
+  stats[, hh_tgt_pos_y_mean := hh_tgt_pos_y_sum / fifelse(hh_tgt_pos_count==0, NA_real_, hh_tgt_pos_count)]
+  stats[is.na(hh_tgt_pos_y_mean), hh_tgt_pos_y_mean := defaults$hh_tgt_pos_y_mean]
+  stats[, hh_tgt_cost_sum_log1p  := log1p(hh_tgt_cost_sum)]
+  stats[, hh_tgt_cost_mean_log1p := log1p(hh_tgt_cost_mean)]
+  stats[, c("hh_tgt_pos_y_sum","hh_tgt_cost_sum","hh_tgt_cost_mean") := NULL]
+  list(stats = stats, defaults = defaults)
+}
+
+add_group_stats_for_prediction <- function(features, source) {
+  agg <- aggregate_target_features(source)
+  out <- copy(features)
+  out[, row_order_tmp := .I]
+  out <- merge(out, agg$stats, by = "hh", all.x = TRUE, sort = FALSE)
+  setorder(out, row_order_tmp)
+  out[, row_order_tmp := NULL]
+  for (col in names(agg$defaults)) {
+    if (col %in% names(out)) {
+      v <- as.numeric(out[[col]]); v[!is.finite(v)] <- NA_real_; v[is.na(v)] <- agg$defaults[[col]]
+      out[, (col) := v]
+    }
+  }
+  out
+}
+
+add_loo_group_stats <- function(features, source) {
+  src <- copy(source[, c("hh", AUX_TARGETS), with = FALSE])
+  src[, row_order_tmp := .I]
+  src[, cost_total := fifelse(is.na(COST_NGOAITRU),0.0,COST_NGOAITRU)+fifelse(is.na(COST_NOITRU),0.0,COST_NOITRU)]
+  src[, freq_total := fifelse(is.na(FRE_NGOAITRU), 0.0,FRE_NGOAITRU) +fifelse(is.na(FRE_NOITRU), 0.0,FRE_NOITRU)]
+  src[, y_val := as.numeric(get(TARGET))]
+  src[, pos   := as.numeric(y_val > 0)]
+  src[, pos_y := y_val * pos]
+  defaults <- global_target_defaults(source)
+
+  src[, group_count   := .N,           by = hh]
+  src[, group_y_sum   := sum(y_val),   by = hh]
+  src[, group_y2_sum  := sum(y_val^2), by = hh]
+  src[, group_pos_count  := sum(pos),  by = hh]
+  src[, group_pos_y_sum  := sum(pos_y),by = hh]
+  src[, group_cost_sum   := sum(cost_total), by = hh]
+  src[, group_freq_sum   := sum(freq_total), by = hh]
+  src[, group_max1 := max(y_val),      by = hh]
+  src[, group_min1 := min(y_val),      by = hh]
+  src[, group_max_count := sum(y_val == max(y_val)), by = hh]
+  src[, group_min_count := sum(y_val == min(y_val)), by = hh]
+  src[, group_second_max := if (.N>1L) sort(y_val,decreasing=TRUE)[2L]  else NA_real_, by = hh]
+  src[, group_second_min := if (.N>1L) sort(y_val,decreasing=FALSE)[2L] else NA_real_, by = hh]
+
+  out       <- copy(features)
+  cnt_ex    <- pmax(as.numeric(src$group_count) - 1.0, 0.0)
+  y_sum_ex  <- src$group_y_sum - src$y_val
+  sum2_ex   <- src$group_y2_sum - src$y_val^2
+  pos_ex    <- src$group_pos_count - src$pos
+  cost_ex   <- pmax(src$group_cost_sum - src$cost_total, 0.0)
+  freq_ex   <- pmax(src$group_freq_sum - src$freq_total, 0.0)
+
+  out[, hh_tgt_count    := cnt_ex]
+  out[, hh_tgt_y_sum    := y_sum_ex]
+  out[, hh_tgt_y_mean   := y_sum_ex / fifelse(cnt_ex==0, NA_real_, cnt_ex)]
+  std_denom <- cnt_ex - 1.0
+  out[, hh_tgt_y_std := sqrt(pmax((sum2_ex - (y_sum_ex^2)/fifelse(cnt_ex==0,NA_real_,cnt_ex))/fifelse(std_denom<=0,NA_real_,std_denom),0.0))]
+  out[, hh_tgt_y_max := fifelse(src$y_val==src$group_max1 & src$group_max_count==1L, src$group_second_max, src$group_max1)]
+  out[, hh_tgt_y_min := fifelse(src$y_val==src$group_min1 & src$group_min_count==1L, src$group_second_min, src$group_min1)]
+  out[, hh_tgt_pos_count  := pmax(pos_ex, 0.0)]
+  out[, hh_tgt_pos_rate   := hh_tgt_pos_count / fifelse(cnt_ex==0, NA_real_, cnt_ex)]
+  out[, hh_tgt_pos_y_mean := (src$group_pos_y_sum - src$pos_y) / fifelse(pos_ex==0, NA_real_, pos_ex)]
+  out[, hh_tgt_cost_sum_log1p  := log1p(cost_ex)]
+  out[, hh_tgt_cost_mean_log1p := log1p(cost_ex / fifelse(cnt_ex==0, NA_real_, cnt_ex))]
+  out[, hh_tgt_freq_sum  := freq_ex]
+  out[, hh_tgt_freq_mean := freq_ex / fifelse(cnt_ex==0, NA_real_, cnt_ex)]
+
+  for (col in names(defaults)) {
+    v <- as.numeric(out[[col]]); v[!is.finite(v)] <- NA_real_; v[is.na(v)] <- defaults[[col]]
+    out[, (col) := v]
+  }
+  out
+}
+
+feature_columns <- function(dt) setdiff(names(dt), ID_COL)
+
+prepare_tree_numeric <- function(train_x, valid_x = NULL, test_x = NULL, cat_cols = character()) {
+  cols    <- feature_columns(train_x)
+  train_p <- copy(train_x[, ..cols])
+  valid_p <- if (!is.null(valid_x)) copy(valid_x[, ..cols]) else NULL
+  test_p  <- if (!is.null(test_x))  copy(test_x[, ..cols])  else NULL
+  cat_present <- intersect(cat_cols, cols)
+
+  for (col in cat_present) {
+    pieces  <- list(cat_value(train_p[[col]]))
+    if (!is.null(valid_p)) pieces <- c(pieces, list(cat_value(valid_p[[col]])))
+    if (!is.null(test_p))  pieces <- c(pieces, list(cat_value(test_p[[col]])))
+    vals    <- unique(unlist(pieces, use.names = FALSE))
+    mapping <- setNames(seq_along(vals) - 1L, vals)
+    for (nm in c("train_p","valid_p","test_p")) {
+      fr <- get(nm); if (is.null(fr)) next
+      enc <- as.integer(mapping[cat_value(fr[[col]])]); enc[is.na(enc)] <- -1L
+      fr[, (col) := enc]; assign(nm, fr)
+    }
+  }
+  for (col in setdiff(cols, cat_present)) {
+    for (nm in c("train_p","valid_p","test_p")) {
+      fr <- get(nm); if (is.null(fr)) next
+      fr[, (col) := suppressWarnings(as.numeric(get(col)))]; assign(nm, fr)
+    }
+  }
+  to_mat <- function(fr) { if (is.null(fr)) return(NULL); m <- as.matrix(fr); storage.mode(m) <- "double"; m }
+  list(train = to_mat(train_p), valid = to_mat(valid_p), test = to_mat(test_p), cat_cols = cat_present)
+}
+```
+
+---
+
+# 🔁 CV Infrastructure
+
+```{r cv-infrastructure}
+make_stratification <- function(y) {
+  labels <- integer(length(y))
+  pos    <- y > 0
+  if (any(pos)) {
+    ranks  <- rank(y[pos], ties.method = "first")
+    breaks <- unique(as.numeric(quantile(ranks, probs = seq(0,1,length.out=6), type=7)))
+    if (length(breaks) > 2L) {
+      labels[pos] <- cut(ranks, breaks = breaks, labels = FALSE, include.lowest = TRUE) + 1L
+    } else {
+      labels[pos] <- 1L
+    }
+  }
+  labels
+}
+
+stratified_folds <- function(labels, k, seed) {
+  set.seed(seed)
+  fold_id <- integer(length(labels))
+  for (lev in unique(labels)) {
+    idx     <- which(labels == lev)
+    idx     <- sample(idx, length(idx))
+    fold_id[idx] <- rep(seq_len(k), length.out = length(idx))
+  }
+  lapply(seq_len(k), function(f) list(train = which(fold_id != f), valid = which(fold_id == f)))
+}
+
+# ── Calibration helpers ───────────────────────────────────────────────────────
+apply_power_calibration <- function(pred, params) {
+  clip_pred(params[[1L]] * (pmax(pred, 0.0)^params[[3L]]) + params[[2L]])
+}
+
+fit_power_calibration <- function(pred, y) {
+  obj <- function(par) rmse(apply_power_calibration(pred, par), y)
+  opt <- optim(c(1.0,0.0,1.0), obj, method = "L-BFGS-B",
+               lower = c(0.5,-1.0,0.5), upper = c(1.5,1.0,1.5),
+               control = list(maxit = 1000L))
+  list(params = as.numeric(opt$par), rmse = opt$value, pred = apply_power_calibration(pred, opt$par))
+}
+
+crossfit_power_calibration_rmse <- function(pred, y, folds) {
+  out <- rep(NA_real_, length(y))
+  for (fold in seq_along(folds)) {
+    tr  <- folds[[fold]]$train; va <- folds[[fold]]$valid
+    cal <- fit_power_calibration(pred[tr], y[tr])
+    out[va] <- apply_power_calibration(pred[va], cal$params)
+  }
+  rmse(out, y)
+}
+
+# ── Blend optimiser ───────────────────────────────────────────────────────────
+softmax_fn <- function(z) { e <- exp(z - max(z)); e / sum(e) }
+
+optimize_blend <- function(results, y) {
+  preds      <- do.call(cbind, lapply(results, `[[`, "oof"))
+  test_preds <- do.call(cbind, lapply(results, `[[`, "test_pred"))
+  mask       <- stats::complete.cases(preds)
+  preds_fit  <- preds[mask, , drop = FALSE]
+  y_fit      <- y[mask]
+  obj <- function(z) rmse(as.numeric(preds_fit %*% softmax_fn(z)), y_fit)
+  opt <- optim(rep(0.0, ncol(preds_fit)), obj, method = "BFGS", control = list(maxit = 1000L))
+  w   <- softmax_fn(opt$par)
+  list(weights = w,
+       cv      = rmse(clip_pred(as.numeric(preds %*% w)), y),
+       oof     = clip_pred(as.numeric(preds %*% w)),
+       test    = clip_pred(as.numeric(test_preds %*% w)))
+}
+```
+
+---
+
+# Step 1 — LightGBM Models
+
+## LightGBM Parameters
+
+```{r lgb-params}
+# <<TUNE>> Adjust these to retune LightGBM.
+# Key knobs: learning_rate (lower = more trees needed but usually better),
+#             num_leaves (higher = more complex model),
+#             min_data_in_leaf (higher = more regularisation),
+#             lambda_l1 / lambda_l2 (L1/L2 regularisation)
+
+lgb_reg_params <- function(seed) {
+  list(
+    objective        = "regression",
+    metric           = "rmse",
+    learning_rate    = 0.0001,          # <<TUNE>>
+    num_leaves       = 64L,            # <<TUNE>>
+    max_depth        = -1L,
+    min_data_in_leaf = 60L,            # <<TUNE>>
+    bagging_fraction = 0.85,           # <<TUNE>>
+    bagging_freq     = 1L,
+    feature_fraction = 0.85,           # <<TUNE>>
+    lambda_l1        = 0.15,           # <<TUNE>>
+    lambda_l2        = 2,            # <<TUNE>>
+    seed             = seed,
+    feature_fraction_seed = seed + 11L,
+    bagging_seed          = seed + 17L,
+    data_random_seed      = seed + 23L,
+    verbosity        = -1L,
+    num_threads      = NUM_THREADS,
+    num_iterations   = 15000L           # <<TUNE>> upper bound; early-stopping controls actual
+  )
+}
+
+lgb_params_for_name <- function(name, seed) {
+  params <- lgb_reg_params(seed)
+  # Optuna-tuned variants — edit values here to override
+  if (name == "lgb_tuned") {
+    params$learning_rate    <- 0.017159591149764574  # <<TUNE>>
+    params$num_leaves       <- 23L
+    params$max_depth        <- 10L
+    params$min_data_in_leaf <- 45L
+    params$bagging_fraction <- 0.9925970843470544
+    params$feature_fraction <- 0.5577279183577541
+    params$lambda_l1        <- 0.7534709735998564
+    params$lambda_l2        <- 11.752006331423209
+    params$min_gain_to_split <- 0.12903081102030184
+    params$extra_trees      <- FALSE
+    params$num_iterations   <- 15000L
+  } else if (name == "lgb_tuned2") {
+    params$learning_rate    <- 0.019675884782309187  # <<TUNE>>
+    params$num_leaves       <- 23L; params$max_depth <- 7L
+    params$min_data_in_leaf <- 32L
+    params$bagging_fraction <- 0.9538880207742806
+    params$feature_fraction <- 0.640478050985748
+    params$lambda_l1        <- 1.1411547731118807;  params$lambda_l2 <- 12.79559567350905
+    params$min_gain_to_split <- 0.06907234208908977; params$extra_trees <- FALSE
+    params$num_iterations   <- 7000L
+  } else if (name == "lgb_tuned3") {
+    params$learning_rate    <- 0.050479289251557896  # <<TUNE>>
+    params$num_leaves       <- 63L; params$max_depth <- -1L
+    params$min_data_in_leaf <- 28L
+    params$bagging_fraction <- 0.7371186860892567
+    params$feature_fraction <- 0.560294800512876
+    params$lambda_l1        <- 2.9707348670911546;  params$lambda_l2 <- 12.438857149359993
+    params$min_gain_to_split <- 0.10097364385806204; params$extra_trees <- FALSE
+    params$num_iterations   <- 15000L
+  }
+  params
+}
+
+lgb_cls_params <- function(seed) {
+  list(
+    objective        = "binary",
+    metric           = "binary_logloss",
+    learning_rate    = 0.0001,          # <<TUNE>>
+    num_leaves       = 64L,            # <<TUNE>>
+    max_depth        = -1L,
+    min_data_in_leaf = 70L,
+    bagging_fraction = 0.85, bagging_freq = 1L,
+    feature_fraction = 0.85,
+    lambda_l1 = 0.1, lambda_l2 = 2.0,
+    seed = seed, feature_fraction_seed = seed+11L,
+    bagging_seed = seed+17L, data_random_seed = seed+23L,
+    verbosity = -1L, num_threads = NUM_THREADS,
+    num_iterations = 10000L             # <<TUNE>>
+  )
+}
+```
+
+## LightGBM Training Loop
+
+```{r lgb-train, eval=TRUE}
+# NOTE: Set eval=TRUE (or remove eval=FALSE) when running end-to-end.
+# This block is eval=FALSE by default to avoid re-training on every knit.
+
+fit_lgb <- function(train_mat, train_y, valid_mat, valid_y, params, cat_cols,
+                    early_stopping_rounds = 500L) {  # <<TUNE>> early stopping patience
+  nrounds           <- params$num_iterations
+  params$num_iterations <- NULL
+  dtrain <- lgb.Dataset(data = train_mat, label = train_y, categorical_feature = cat_cols)
+  dvalid <- lgb.Dataset(data = valid_mat, label = valid_y, categorical_feature = cat_cols)
+  model  <- lgb.train(params = params, data = dtrain, nrounds = nrounds,
+                      valids = list(valid = dvalid),
+                      early_stopping_rounds = early_stopping_rounds, verbose = -1L)
+  best_iter <- model$best_iter
+  if (is.null(best_iter) || length(best_iter)==0L || best_iter<=0L) best_iter <- nrounds
+  list(model = model, best_iter = as.integer(best_iter))
+}
+
+train_lgb_regression_cv <- function(name, train_base, test_base, train_raw, y,
+                                    folds, cat_cols, seed) {
+  oof <- rep(NA_real_, length(y)); test_folds <- list()
+  fold_scores <- numeric(); best_iterations <- integer()
+  tuned_seed_offsets <- c(lgb_tuned=16L, lgb_tuned2=23L, lgb_tuned3=28L)
+
+  for (fold in seq_along(folds)) {
+    tr_idx  <- folds[[fold]]$train; va_idx <- folds[[fold]]$valid
+    x_tr <- add_loo_group_stats(copy(train_base[tr_idx]), copy(train_raw[tr_idx]))
+    x_va <- add_group_stats_for_prediction(copy(train_base[va_idx]), copy(train_raw[tr_idx]))
+    x_te <- add_group_stats_for_prediction(copy(test_base),          copy(train_raw[tr_idx]))
+    prep <- prepare_tree_numeric(x_tr, x_va, x_te, cat_cols)
+
+    offset <- if (name %in% names(tuned_seed_offsets)) tuned_seed_offsets[[name]] else fold
+    fit  <- fit_lgb(prep$train, y[tr_idx], prep$valid, y[va_idx],
+                    lgb_params_for_name(name, seed+offset), prep$cat_cols)
+    pred <- clip_pred(predict(fit$model, prep$valid, num_iteration = fit$best_iter))
+    oof[va_idx] <- pred
+    test_folds[[fold]] <- clip_pred(predict(fit$model, prep$test, num_iteration = fit$best_iter))
+    score <- rmse(pred, y[va_idx]); fold_scores <- c(fold_scores, score)
+    best_iterations <- c(best_iterations, fit$best_iter)
+    cat(sprintf("%s fold %d: RMSE=%.6f, best_iter=%d\n", name, fold, score, fit$best_iter))
+  }
+  list(name = name, oof = oof, test_pred = rowMeans(do.call(cbind, test_folds)),
+       fold_scores = fold_scores, best_iterations = best_iterations)
+}
+
+train_lgb_hurdle_cv <- function(name, train_base, test_base, train_raw, y,
+                                folds, cat_cols, seed) {
+  oof <- rep(NA_real_, length(y)); test_folds <- list()
+  fold_scores <- numeric(); best_iterations <- integer()
+  y_bin <- as.integer(y > 0)
+
+  for (fold in seq_along(folds)) {
+    tr_idx <- folds[[fold]]$train; va_idx <- folds[[fold]]$valid
+    x_tr <- add_loo_group_stats(copy(train_base[tr_idx]), copy(train_raw[tr_idx]))
+    x_va <- add_group_stats_for_prediction(copy(train_base[va_idx]), copy(train_raw[tr_idx]))
+    x_te <- add_group_stats_for_prediction(copy(test_base),          copy(train_raw[tr_idx]))
+    prep <- prepare_tree_numeric(x_tr, x_va, x_te, cat_cols)
+
+    cls_fit <- fit_lgb(prep$train, y_bin[tr_idx], prep$valid, y_bin[va_idx],
+                       lgb_cls_params(seed+fold), prep$cat_cols)
+    pos_tr  <- y[tr_idx] > 0; pos_va <- y[va_idx] > 0
+    reg_fit <- fit_lgb(prep$train[pos_tr,,drop=FALSE], y[tr_idx][pos_tr],
+                       prep$valid[pos_va,,drop=FALSE], y[va_idx][pos_va],
+                       lgb_reg_params(seed+100L+fold), prep$cat_cols)
+
+    p_va  <- predict(cls_fit$model, prep$valid, num_iteration = cls_fit$best_iter)
+    mu_va <- predict(reg_fit$model, prep$valid, num_iteration = reg_fit$best_iter)
+    pred  <- clip_pred(p_va * mu_va); oof[va_idx] <- pred
+    p_te  <- predict(cls_fit$model, prep$test, num_iteration = cls_fit$best_iter)
+    mu_te <- predict(reg_fit$model, prep$test, num_iteration = reg_fit$best_iter)
+    test_folds[[fold]] <- clip_pred(p_te * mu_te)
+    score <- rmse(pred, y[va_idx]); fold_scores <- c(fold_scores, score)
+    best_iterations <- c(best_iterations, reg_fit$best_iter)
+    cat(sprintf("%s fold %d: RMSE=%.6f, reg_best_iter=%d\n", name, fold, score, reg_fit$best_iter))
+  }
+  list(name = name, oof = oof, test_pred = rowMeans(do.call(cbind, test_folds)),
+       fold_scores = fold_scores, best_iterations = best_iterations)
+}
+
+# ── Run LightGBM ─────────────────────────────────────────────────────────────
+train_raw   <- split_id_df(train)
+base        <- add_base_features(train, test)
+train_base  <- base$train_base; test_base <- base$test_base; cat_cols <- base$cat_cols
+folds_lgb   <- stratified_folds(make_stratification(y), N_FOLDS, RANDOM_SEED)
+
+lgb_model_names <- c("lgb_hurdle", "lgb_tuned", "lgb_tuned2", "lgb_tuned3")
+                   # <<TUNE>> also available: "lgb_tuned2"
+lgb_results     <- list()
+for (m in lgb_model_names) {
+  cat(sprintf("\n=== Training %s ===\n", m))
+  if (m == "lgb_hurdle") {
+    lgb_results[[length(lgb_results)+1L]] <-
+      train_lgb_hurdle_cv(m, train_base, test_base, train_raw, y, folds_lgb, cat_cols, RANDOM_SEED)
+  } else {
+    lgb_results[[length(lgb_results)+1L]] <-
+      train_lgb_regression_cv(m, train_base, test_base, train_raw, y, folds_lgb, cat_cols, RANDOM_SEED)
+  }
+  cat(sprintf("%s OOF RMSE: %.6f\n", m, rmse(lgb_results[[length(lgb_results)]]$oof, y)))
+}
+
+lgb_blend   <- optimize_blend(lgb_results, y)
+lgb_cal     <- fit_power_calibration(lgb_blend$oof, y)
+
+# Log LGB results
+lgb_summary <- data.table(
+  model = c(names(lgb_results), "blend", "blend_powercal"),
+  oof_rmse = c(sapply(lgb_results, function(x) rmse(x$oof, y)), lgb_blend$cv, lgb_cal$rmse)
+)
+fwrite(lgb_summary, file.path(OUT_DIR_LGB, "lgb_oof_rmse.csv"))
+cat("\n--- LGB OOF RMSE summary saved ---\n")
+print(lgb_summary)
+
+# Save LGB OOF/test tables (needed by v3/v4 stages)
+dir.create(OUT_DIR_LGB, showWarnings = FALSE, recursive = TRUE)
+lgb_stamp   <- format(Sys.time(), "%Y%m%d_%H%M%S")
+
+lgb_oof_dt  <- data.table(ID = train_ids)
+lgb_test_dt <- data.table(ID = sample[[ID_COL]])
+for (res in lgb_results) { lgb_oof_dt[, (res$name) := res$oof]; lgb_test_dt[, (res$name) := res$test_pred] }
+lgb_oof_dt[, blend := lgb_blend$oof]; lgb_oof_dt[, blend_powercal := lgb_cal$pred]; lgb_oof_dt[, y := y]
+lgb_test_dt[, blend := lgb_blend$test]; lgb_test_dt[, blend_powercal := apply_power_calibration(lgb_blend$test, lgb_cal$params)]
+
+lgb_oof_path  <- file.path(OUT_DIR_LGB, sprintf("oof_predictions_r_%s.csv",       lgb_stamp))
+lgb_test_path <- file.path(OUT_DIR_LGB, sprintf("test_model_predictions_r_%s.csv", lgb_stamp))
+fwrite(lgb_oof_dt,  lgb_oof_path)
+fwrite(lgb_test_dt, lgb_test_path)
+cat("LGB OOF  :", lgb_oof_path,  "\n")
+cat("LGB Test :", lgb_test_path, "\n")
+cat(sprintf("LGB Blend OOF RMSE: %.6f | PowerCal RMSE: %.6f\n", lgb_blend$cv, lgb_cal$rmse))
+```
+
+---
+
+# Step 2 — XGBoost Models
+
+## XGBoost Parameters
+
+```{r xgb-params}
+# <<TUNE>> Key knobs for XGBoost:
+#   eta           — learning rate (lower = slower but often better)
+#   max_depth     — tree depth (3–7 typical for tabular)
+#   min_child_weight — minimum sum of instance weight in a leaf (acts like min_data_in_leaf)
+#   subsample / colsample_bytree — row/col sampling per tree
+#   lambda / alpha — L2 / L1 weight regularisation
+#   gamma         — minimum loss reduction to make a split (higher = more conservative)
+
+xgb_params_for_name <- function(name, seed) {
+  base <- list(
+    objective       = "reg:squarederror",
+    eval_metric     = "rmse",
+    tree_method     = "hist",
+    max_cat_to_onehot  = 8L,           # <<TUNE>>
+    max_cat_threshold  = 64L,          # <<TUNE>>
+    eta             = 0.005,           # <<TUNE>>
+    max_depth       = 6L,              # <<TUNE>>
+    min_child_weight = 14.0,           # <<TUNE>>
+    subsample       = 0.88,            # <<TUNE>>
+    colsample_bytree = 0.78,           # <<TUNE>>
+    lambda          = 4.0,             # <<TUNE>>
+    alpha           = 0.20,            # <<TUNE>>
+    gamma           = 0.04,            # <<TUNE>>
+    seed            = seed,
+    nthread         = NUM_THREADS,
+    nrounds         = 15000L            # <<TUNE>> upper bound
+  )
+  if (name == "xgb_tuned") {
+    base$eta <- 0.018; base$max_depth <- 5L; base$min_child_weight <- 24.0
+    base$subsample <- 0.94; base$colsample_bytree <- 0.62
+    base$lambda <- 9.0; base$alpha <- 0.65; base$gamma <- 0.08; base$nrounds <- 20000L
+  } else if (name == "xgb_tuned2") {
+    base$eta <- 0.014; base$max_depth <- 6L; base$min_child_weight <- 32.0
+    base$subsample <- 0.96; base$colsample_bytree <- 0.58
+    base$lambda <- 12.0; base$alpha <- 0.85; base$gamma <- 0.10; base$nrounds <- 20000L
+  } else if (name == "xgb_tuned3") {
+    base$eta <- 0.045; base$max_depth <- 4L; base$min_child_weight <- 20.0
+    base$subsample <- 0.78; base$colsample_bytree <- 0.58
+    base$lambda <- 11.5; base$alpha <- 2.2; base$gamma <- 0.10; base$nrounds <- 20000L
+  } else if (name == "xgb_deep") {
+    base$eta <- 0.020; base$max_depth <- 7L; base$min_child_weight <- 18.0
+    base$subsample <- 0.86; base$colsample_bytree <- 0.68
+    base$lambda <- 7.0; base$alpha <- 0.35; base$gamma <- 0.06; base$nrounds <- 20000L
+  }
+  base
+}
+
+xgb_cls_params <- function(seed) {
+  list(
+    objective = "binary:logistic", eval_metric = "logloss",
+    tree_method = "hist", max_cat_to_onehot = 8L, max_cat_threshold = 64L,
+    eta = 0.005, max_depth = 5L, min_child_weight = 18.0,  # <<TUNE>>
+    subsample = 0.90, colsample_bytree = 0.70,              # <<TUNE>>
+    lambda = 4.0, alpha = 0.20, gamma = 0.04,               # <<TUNE>>
+    seed = seed, nthread = NUM_THREADS, nrounds = 3500L
+  )
+}
+```
+
+## XGBoost Training Loop
+
+```{r xgb-train, eval=TRUE}
+xgb_feature_types <- function(mat, cat_cols) {
+  types <- rep("q", ncol(mat)); names(types) <- colnames(mat)
+  types[intersect(cat_cols, names(types))] <- "c"
+  unname(types)
+}
+
+xgb_best_iter <- function(model, default_nrounds) {
+  best <- attr(model, "best_iteration")
+  if (!is.null(best) && length(best)>0L && is.finite(best) && best>0L) return(as.integer(best))
+  eval_log <- attr(model, "evaluation_log")
+  if (!is.null(eval_log)) return(nrow(eval_log))
+  as.integer(default_nrounds)
+}
+
+fit_xgb <- function(train_mat, train_y, valid_mat, valid_y, params, cat_cols,
+                    early_stopping_rounds = 400L) {  # <<TUNE>> patience
+  nrounds      <- params$nrounds; params$nrounds <- NULL
+  ft           <- xgb_feature_types(train_mat, cat_cols)
+  dtrain       <- xgb.DMatrix(train_mat, label=train_y, missing=NA, feature_types=ft)
+  dvalid       <- xgb.DMatrix(valid_mat, label=valid_y, missing=NA, feature_types=ft)
+  model        <- xgb.train(params=params, data=dtrain, nrounds=nrounds,
+                             evals=list(valid=dvalid),
+                             early_stopping_rounds=early_stopping_rounds, verbose=0)
+  list(model=model, best_iter=xgb_best_iter(model, nrounds))
+}
+
+predict_xgb <- function(model, mat, cat_cols, ntreelimit) {
+  dmat <- xgb.DMatrix(mat, missing=NA, feature_types=xgb_feature_types(mat, cat_cols))
+  clip_pred(predict(model, dmat, iterationrange=c(1L, as.integer(ntreelimit))))
+}
+
+train_xgb_regression_cv <- function(name, train_base, test_base, train_raw, y,
+                                    folds, cat_cols, seed) {
+  oof <- rep(NA_real_, length(y)); test_folds <- list()
+  fold_scores <- numeric(); best_iterations <- integer()
+  seed_offsets <- c(xgb_reg=3L, xgb_tuned=16L, xgb_tuned2=23L, xgb_tuned3=28L, xgb_deep=35L)
+
+  for (fold in seq_along(folds)) {
+    tr_idx <- folds[[fold]]$train; va_idx <- folds[[fold]]$valid
+    x_tr   <- add_loo_group_stats(copy(train_base[tr_idx]), copy(train_raw[tr_idx]))
+    x_va   <- add_group_stats_for_prediction(copy(train_base[va_idx]), copy(train_raw[tr_idx]))
+    x_te   <- add_group_stats_for_prediction(copy(test_base),          copy(train_raw[tr_idx]))
+    prep   <- prepare_tree_numeric(x_tr, x_va, x_te, cat_cols)
+    offset <- if (name %in% names(seed_offsets)) seed_offsets[[name]] else fold
+    fit    <- fit_xgb(prep$train, y[tr_idx], prep$valid, y[va_idx],
+                      xgb_params_for_name(name, seed+offset+fold), prep$cat_cols)
+    pred   <- predict_xgb(fit$model, prep$valid, prep$cat_cols, fit$best_iter)
+    oof[va_idx] <- pred
+    test_folds[[fold]] <- predict_xgb(fit$model, prep$test, prep$cat_cols, fit$best_iter)
+    score  <- rmse(pred, y[va_idx]); fold_scores <- c(fold_scores, score)
+    best_iterations <- c(best_iterations, fit$best_iter)
+    cat(sprintf("%s fold %d: RMSE=%.6f, best_iter=%d\n", name, fold, score, fit$best_iter))
+  }
+  list(name=name, oof=oof, test_pred=rowMeans(do.call(cbind, test_folds)),
+       fold_scores=fold_scores, best_iterations=best_iterations)
+}
+
+train_xgb_hurdle_cv <- function(name, train_base, test_base, train_raw, y,
+                                folds, cat_cols, seed) {
+  oof <- rep(NA_real_, length(y)); test_folds <- list()
+  fold_scores <- numeric(); best_iterations <- integer()
+  y_bin <- as.integer(y > 0)
+
+  for (fold in seq_along(folds)) {
+    tr_idx <- folds[[fold]]$train; va_idx <- folds[[fold]]$valid
+    x_tr   <- add_loo_group_stats(copy(train_base[tr_idx]), copy(train_raw[tr_idx]))
+    x_va   <- add_group_stats_for_prediction(copy(train_base[va_idx]), copy(train_raw[tr_idx]))
+    x_te   <- add_group_stats_for_prediction(copy(test_base),          copy(train_raw[tr_idx]))
+    prep   <- prepare_tree_numeric(x_tr, x_va, x_te, cat_cols)
+
+    cls_fit <- fit_xgb(prep$train, y_bin[tr_idx], prep$valid, y_bin[va_idx],
+                       xgb_cls_params(seed+fold), prep$cat_cols)
+    pos_tr  <- y[tr_idx] > 0; pos_va <- y[va_idx] > 0
+    reg_p   <- xgb_params_for_name("xgb_tuned", seed+100L+fold)
+    reg_p$min_child_weight <- 6.0; reg_p$lambda <- 5.0; reg_p$alpha <- 0.15  # <<TUNE>>
+    reg_fit <- fit_xgb(prep$train[pos_tr,,drop=FALSE], y[tr_idx][pos_tr],
+                       prep$valid[pos_va,,drop=FALSE], y[va_idx][pos_va],
+                       reg_p, prep$cat_cols)
+
+    pred <- clip_pred(predict_xgb(cls_fit$model, prep$valid, prep$cat_cols, cls_fit$best_iter) *
+                      predict_xgb(reg_fit$model, prep$valid, prep$cat_cols, reg_fit$best_iter))
+    oof[va_idx] <- pred
+    test_folds[[fold]] <- clip_pred(
+      predict_xgb(cls_fit$model, prep$test, prep$cat_cols, cls_fit$best_iter) *
+      predict_xgb(reg_fit$model, prep$test, prep$cat_cols, reg_fit$best_iter))
+    score <- rmse(pred, y[va_idx]); fold_scores <- c(fold_scores, score)
+    best_iterations <- c(best_iterations, reg_fit$best_iter)
+    cat(sprintf("%s fold %d: RMSE=%.6f, reg_best_iter=%d\n", name, fold, score, reg_fit$best_iter))
+  }
+  list(name=name, oof=oof, test_pred=rowMeans(do.call(cbind, test_folds)),
+       fold_scores=fold_scores, best_iterations=best_iterations)
+}
+
+# ── Run XGBoost ───────────────────────────────────────────────────────────────
+xgb_model_names <- c("xgb_hurdle", "xgb_tuned", "xgb_tuned2", "xgb_tuned3", "xgb_deep")
+                   # <<TUNE>> remove models you don't want to train
+folds_xgb   <- stratified_folds(make_stratification(y), N_FOLDS, RANDOM_SEED)
+xgb_results <- list()
+for (m in xgb_model_names) {
+  cat(sprintf("\n=== Training %s ===\n", m))
+  if (m == "xgb_hurdle") {
+    xgb_results[[length(xgb_results)+1L]] <-
+      train_xgb_hurdle_cv(m, train_base, test_base, train_raw, y, folds_xgb, cat_cols, RANDOM_SEED)
+  } else {
+    xgb_results[[length(xgb_results)+1L]] <-
+      train_xgb_regression_cv(m, train_base, test_base, train_raw, y, folds_xgb, cat_cols, RANDOM_SEED)
+  }
+  cat(sprintf("%s OOF RMSE: %.6f\n", m, rmse(xgb_results[[length(xgb_results)]]$oof, y)))
+}
+
+xgb_blend   <- optimize_blend(xgb_results, y)
+xgb_cal     <- fit_power_calibration(xgb_blend$oof, y)
+
+xgb_summary <- data.table(
+  model = c(names(xgb_results), "blend", "blend_powercal"),
+  oof_rmse = c(sapply(xgb_results, function(x) rmse(x$oof, y)), xgb_blend$cv, xgb_cal$rmse)
+)
+fwrite(xgb_summary, file.path(OUT_DIR_XGB, "xgb_oof_rmse.csv"))
+cat("\n--- XGB OOF RMSE summary saved ---\n")
+print(xgb_summary)
+
+dir.create(OUT_DIR_XGB, showWarnings = FALSE, recursive = TRUE)
+xgb_stamp   <- format(Sys.time(), "%Y%m%d_%H%M%S")
+
+xgb_oof_dt  <- data.table(ID = train_ids)
+xgb_test_dt <- data.table(ID = sample[[ID_COL]])
+for (res in xgb_results) { xgb_oof_dt[,(res$name)] <- res$oof; xgb_test_dt[,(res$name)] <- res$test_pred }
+xgb_oof_dt[, blend := xgb_blend$oof]; xgb_oof_dt[, blend_powercal := xgb_cal$pred]; xgb_oof_dt[, y := y]
+xgb_test_dt[, blend := xgb_blend$test]; xgb_test_dt[, blend_powercal := apply_power_calibration(xgb_blend$test, xgb_cal$params)]
+
+xgb_oof_path  <- file.path(OUT_DIR_XGB, sprintf("oof_predictions_xgb_%s.csv",        xgb_stamp))
+xgb_test_path <- file.path(OUT_DIR_XGB, sprintf("test_model_predictions_xgb_%s.csv",  xgb_stamp))
+fwrite(xgb_oof_dt,  xgb_oof_path)
+fwrite(xgb_test_dt, xgb_test_path)
+cat(sprintf("XGB Blend OOF RMSE: %.6f | PowerCal RMSE: %.6f\n", xgb_blend$cv, xgb_cal$rmse))
+```
+
+---
+
+# Step 3 — LGB + XGB Softmax Blend
+
+```{r blend, eval=TRUE}
+# NOTE: Update file paths below to match the timestamps from Steps 1 & 2.
+# <<TUNE>> LGB_OOF_FILE and XGB_OOF_FILE — change to actual stamped filenames
+LGB_OOF_FILE  <- lgb_oof_path    # or hard-code: "submissions/oof_predictions_r_YYYYMMDD_HHMMSS.csv"
+LGB_TEST_FILE <- lgb_test_path
+XGB_OOF_FILE  <- xgb_oof_path
+XGB_TEST_FILE <- xgb_test_path
+
+optimize_named_blend <- function(oof_dt, test_dt, model_cols, y) {
+  pred_mat  <- as.matrix(oof_dt[,  ..model_cols]); storage.mode(pred_mat) <- "double"
+  test_mat  <- as.matrix(test_dt[, ..model_cols]); storage.mode(test_mat) <- "double"
+  mask      <- stats::complete.cases(pred_mat)
+  obj <- function(z) { w <- softmax_fn(z); rmse(clip_pred(as.numeric(pred_mat[mask,,drop=FALSE] %*% w)), y[mask]) }
+  opt <- optim(rep(0, length(model_cols)), obj, method = "BFGS", control = list(maxit = 2000L))
+  w   <- softmax_fn(opt$par); names(w) <- model_cols
+  list(weights=w, oof=clip_pred(as.numeric(pred_mat %*% w)), test=clip_pred(as.numeric(test_mat %*% w)))
+}
+
+lgb_oof_blend  <- fread(LGB_OOF_FILE);  lgb_test_blend  <- fread(LGB_TEST_FILE)
+xgb_oof_blend  <- fread(XGB_OOF_FILE);  xgb_test_blend  <- fread(XGB_TEST_FILE)
+stopifnot(all(lgb_oof_blend$ID == xgb_oof_blend$ID))
+
+y_blend    <- as.numeric(lgb_oof_blend$y)
+oof_blend  <- data.table(ID = lgb_oof_blend$ID)
+test_blend <- data.table(ID = lgb_test_blend$ID)
+
+for (col in c("lgb_hurdle","lgb_tuned","lgb_tuned3","blend","blend_powercal")) {
+  oof_blend[,  paste0("lgb_", col) := lgb_oof_blend[[col]]]
+  test_blend[, paste0("lgb_", col) := lgb_test_blend[[col]]]
+}
+for (col in c("xgb_hurdle","xgb_tuned","xgb_tuned2","xgb_tuned3","xgb_deep","blend","blend_powercal")) {
+  oof_blend[,  paste0("xgb_", col) := xgb_oof_blend[[col]]]
+  test_blend[, paste0("xgb_", col) := xgb_test_blend[[col]]]
+}
+
+blend_cols  <- setdiff(names(oof_blend), "ID")
+son_blend   <- optimize_named_blend(oof_blend, test_blend, blend_cols, y_blend)
+blend_rmse  <- rmse(son_blend$oof, y_blend)
+cat(sprintf("Son flow blend OOF RMSE: %.6f\n", blend_rmse))
+
+# Optional power calibration
+son_cal       <- fit_power_calibration(son_blend$oof, y_blend)
+son_blend_folds <- stratified_folds(make_stratification(y_blend), N_FOLDS, RANDOM_SEED)
+blend_cv_rmse <- crossfit_power_calibration_rmse(son_blend$oof, y_blend, son_blend_folds)
+use_power     <- son_cal$rmse < blend_rmse && blend_cv_rmse <= blend_rmse + 0.0008  # <<TUNE>> tolerance
+final_son     <- if (use_power) son_cal else list(test = son_blend$test)
+cat(sprintf("Power-cal used: %s (in-sample: %.6f, CV: %.6f)\n", use_power, son_cal$rmse, blend_cv_rmse))
+
+blend_log <- data.table(
+  method = c("softmax_blend", "softmax_powercal"),
+  oof_rmse = c(rmse(son_blend$oof, y_blend), son_cal$rmse)
+)
+fwrite(blend_log, file.path(OUT_DIR_XGB, "blend_oof_rmse.csv"))
+cat("\n--- Blend OOF RMSE ---\n")
+print(blend_log)
+
+sub_son <- copy(sample); sub_son[, y.hat := final_son$test]
+fwrite(sub_son, file.path(OUT_DIR_XGB, "submission_son_flow_xgb_enhanced.csv"))
+```
+
+---
+
+# Step 4 — Ridge Meta-Stacking (v3)
+
+```{r ridge-meta, eval=TRUE}
+# <<TUNE>> RIDGE_LAMBDA — try values in c(1e-4, 1e-3, 1e-2, 0.1); script searches automatically
+# <<TUNE>> COLUMN_SETS  — controls which base predictions enter the meta-learner
+
+ridge_fit <- function(X, y_r, lambda) {
+  X       <- cbind(intercept = 1, X)
+  p       <- ncol(X)
+  penalty <- diag(p); penalty[1,1] <- 0
+  XtX     <- crossprod(X) / nrow(X)
+  Xty     <- crossprod(X, y_r) / nrow(X)
+  as.numeric(solve(XtX + max(lambda, 1e-8) * penalty, Xty))
+}
+
+ridge_predict <- function(X, beta) clip_pred(as.numeric(cbind(intercept=1, X) %*% beta))
+
+cv_ridge <- function(oof, y_r, folds, cols, lambda) {
+  X <- as.matrix(oof[, ..cols]); storage.mode(X) <- "double"
+  pred <- rep(NA_real_, length(y_r))
+  for (fold in seq_along(folds)) {
+    tr <- folds[[fold]]$train; va <- folds[[fold]]$valid
+    beta <- ridge_fit(X[tr,,drop=FALSE], y_r[tr], lambda)
+    pred[va] <- ridge_predict(X[va,,drop=FALSE], beta)
+  }
+  list(rmse = rmse(pred, y_r), pred = pred)
+}
+
+# Column sets to search — add/remove sets here
+# <<TUNE>>
+all_cols <- setdiff(names(oof_blend), "ID")
+column_sets <- list(
+  all     = all_cols,
+  base    = c("lgb_lgb_hurdle","lgb_lgb_tuned","lgb_lgb_tuned3","xgb_xgb_hurdle","xgb_xgb_tuned","xgb_xgb_tuned2","xgb_xgb_tuned3","xgb_xgb_deep"),
+  strong  = c("lgb_lgb_tuned","lgb_lgb_tuned3","lgb_blend","lgb_blend_powercal","xgb_xgb_hurdle","xgb_xgb_tuned2","xgb_xgb_deep","xgb_blend","xgb_blend_powercal"),
+  compact = c("lgb_blend","lgb_blend_powercal","xgb_xgb_hurdle","xgb_blend","xgb_blend_powercal")
+)
+# Thêm nhiều lambda hơn, range rộng hơn
+lambdas <- c(0, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4,
+             1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.3, 1, 3, 10, 30)
+
+v3_folds   <- stratified_folds(make_stratification(y_blend), N_FOLDS, RANDOM_SEED + 131L)
+rows       <- list(); cv_preds <- list()
+for (set_name in names(column_sets)) {
+  cols <- column_sets[[set_name]]
+  for (lambda in lambdas) {
+    cv  <- cv_ridge(oof_blend, y_blend, v3_folds, cols, lambda)
+    key <- paste(set_name, lambda, sep = "__")
+    cv_preds[[key]] <- cv$pred
+    rows[[length(rows)+1L]] <- data.table(set=set_name, lambda=lambda, meta_cv_rmse=cv$rmse,
+                                          cols=paste(cols,collapse="|"), model_key=key)
+  }
+}
+v3_results <- rbindlist(rows); setorder(v3_results, meta_cv_rmse)
+best_v3    <- v3_results[1]
+cat(sprintf("Best Ridge: set=%s, lambda=%.5f, CV RMSE=%.6f\n", best_v3$set, best_v3$lambda, best_v3$meta_cv_rmse))
+
+fwrite(v3_results, file.path(OUT_DIR_XGB, "ridge_meta_cv_results_v3.csv"))
+cat("\n--- Best V3 config ---\n")
+print(v3_results[1])
+
+cols_best <- strsplit(best_v3$cols, "\\|")[[1]]
+X_oof     <- as.matrix(oof_blend[, ..cols_best]);  storage.mode(X_oof)  <- "double"
+X_test    <- as.matrix(test_blend[, ..cols_best]); storage.mode(X_test) <- "double"
+beta_v3   <- ridge_fit(X_oof, y_blend, best_v3$lambda)
+v3_oof    <- ridge_predict(X_oof,  beta_v3)
+v3_test   <- ridge_predict(X_test, beta_v3)
+
+v3_cal     <- fit_power_calibration(v3_oof, y_blend)
+v3_cv_rmse <- crossfit_power_calibration_rmse(cv_preds[[best_v3$model_key]], y_blend, v3_folds)
+use_v3_pow <- v3_cal$rmse < rmse(v3_oof, y_blend) && v3_cv_rmse <= best_v3$meta_cv_rmse
+final_v3   <- if (use_v3_pow) apply_power_calibration(v3_test, v3_cal$params) else v3_test
+cat(sprintf("V3 final RMSE (in-sample): %.6f, power-cal used: %s\n", rmse(if(use_v3_pow) v3_cal$pred else v3_oof, y_blend), use_v3_pow))
+
+sub_v3 <- copy(sample); sub_v3[, y.hat := final_v3]
+fwrite(sub_v3, file.path(OUT_DIR_XGB, "submission_xgb_enhanced_v3_ridge_meta.csv"))
+fwrite(v3_results, file.path(OUT_DIR_XGB, "ridge_meta_cv_results_v3.csv"))
+```
+
+---
+
+# Step 5 — XGBoost Residual Correction (v4)
+
+```{r residual-correction, eval=TRUE}
+# <<TUNE>> Key parameters in this stage:
+#   RESID_CLIP       — already set globally at top (default 1.2)
+#   shrink_grid      — range and step for shrinkage search
+#   xgb_residual_params  — conservative tree params for residual model
+
+xgb_residual_params <- function(name, seed) {
+  params <- list(
+    objective = "reg:squarederror", eval_metric = "rmse",
+    tree_method = "hist", max_cat_to_onehot = 8L, max_cat_threshold = 64L,
+    eta = 0.0001,            # <<TUNE>>
+    max_depth = 3L,        # <<TUNE>> keep shallow to avoid overfitting residuals
+    min_child_weight = 60, # <<TUNE>> high value = conservative
+    subsample = 0.90, colsample_bytree = 0.70,
+    lambda = 12, alpha = 2, gamma = 0.0,
+    seed = seed, nthread = NUM_THREADS,
+    nrounds = 10000L        # <<TUNE>>
+  )
+  if (name == "resid_mid") {
+    params$eta <- 0.025; params$max_depth <- 4L; params$min_child_weight <- 60  # <<TUNE>>
+    params$lambda <- 8; params$alpha <- 1; params$nrounds <- 1500L
+  } else if (name == "resid_smooth") {
+    params$eta <- 0.012; params$max_depth <- 3L; params$min_child_weight <- 120  # <<TUNE>>
+    params$subsample <- 0.95; params$colsample_bytree <- 0.65
+    params$lambda <- 18; params$alpha <- 3; params$nrounds <- 1800L
+  }
+  params
+}
+
+add_prediction_features <- function(x, pred_dt, base_pred, row_idx = NULL) {
+  out    <- copy(x)
+  p      <- if (is.null(row_idx)) copy(pred_dt)       else copy(pred_dt[row_idx])
+  b      <- if (is.null(row_idx)) base_pred            else base_pred[row_idx]
+  pred_cols <- setdiff(names(p), "ID")
+  for (col in pred_cols) out[, paste0("meta_", col) := p[[col]]]
+  out[, meta_base_v3      := b]
+  out[, meta_base_v3_sq   := b^2]
+  out[, meta_base_v3_log1p := log1p(pmax(b, 0))]
+  out
+}
+
+v3_base_predictions <- function(oof, test, y_r, folds) {
+  cols    <- setdiff(names(oof), "ID")
+  lambda  <- 0.01   # <<TUNE>> fixed lambda for v3 base inside v4
+  X       <- as.matrix(oof[,  ..cols]); storage.mode(X) <- "double"
+  Xtest   <- as.matrix(test[, ..cols]); storage.mode(Xtest) <- "double"
+  cv_pred <- rep(NA_real_, length(y_r))
+  for (fold in seq_along(folds)) {
+    tr  <- folds[[fold]]$train; va <- folds[[fold]]$valid
+    beta_fold <- ridge_fit(X[tr,,drop=FALSE], y_r[tr], lambda)
+    cv_pred[va] <- ridge_predict(X[va,,drop=FALSE], beta_fold)
+  }
+  beta <- ridge_fit(X, y_r, lambda)
+  list(cols=cols, lambda=lambda, cv_oof=cv_pred,
+       full_oof=ridge_predict(X, beta), test=ridge_predict(Xtest, beta), beta=beta)
+}
+
+fit_residual_xgb <- function(train_mat, train_y, valid_mat, valid_y, params, cat_cols) {
+  nrounds <- params$nrounds; params$nrounds <- NULL
+  ft      <- xgb_feature_types(train_mat, cat_cols)
+  dtrain  <- xgb.DMatrix(train_mat, label=train_y, missing=NA, feature_types=ft)
+  dvalid  <- xgb.DMatrix(valid_mat, label=valid_y, missing=NA, feature_types=ft)
+  model   <- xgb.train(params=params, data=dtrain, nrounds=nrounds,
+                       evals=list(valid=dvalid), early_stopping_rounds=150, verbose=0)
+  early   <- attr(model, "early_stop")
+  best    <- if (!is.null(early)) early$best_iteration else NULL
+  if (is.null(best)||length(best)==0L||!is.finite(best)||best<=0) {
+    el <- attr(model,"evaluation_log"); best <- if(!is.null(el)) nrow(el) else nrounds
+  }
+  list(model=model, best_iter=as.integer(best))
+}
+
+predict_residual_xgb <- function(model, mat, cat_cols, best_iter) {
+  dmat <- xgb.DMatrix(mat, missing=NA, feature_types=xgb_feature_types(mat, cat_cols))
+  as.numeric(predict(model, dmat, iterationrange=c(1L, as.integer(best_iter))))
+}
+
+run_residual_cv <- function(config_name, train_base, train_raw, pred_oof, y_r,
+                            folds, cat_cols, base_cv) {
+  resid_oof <- rep(NA_real_, length(y_r)); records <- list()
+  for (fold in seq_along(folds)) {
+    tr_idx <- folds[[fold]]$train; va_idx <- folds[[fold]]$valid
+    x_tr   <- add_loo_group_stats(copy(train_base[tr_idx]), copy(train_raw[tr_idx]))
+    x_va   <- add_group_stats_for_prediction(copy(train_base[va_idx]), copy(train_raw[tr_idx]))
+    x_tr   <- add_prediction_features(x_tr, pred_oof, base_cv, tr_idx)
+    x_va   <- add_prediction_features(x_va, pred_oof, base_cv, va_idx)
+    prep   <- prepare_tree_numeric(x_tr, x_va, NULL, cat_cols)
+    y_tr   <- y_r[tr_idx] - base_cv[tr_idx]; y_va <- y_r[va_idx] - base_cv[va_idx]
+
+    fit        <- fit_residual_xgb(prep$train, y_tr, prep$valid, y_va,
+                                   xgb_residual_params(config_name, RANDOM_SEED+1000L+fold), prep$cat_cols)
+    pred_resid <- clip_residual(predict_residual_xgb(fit$model, prep$valid, prep$cat_cols, fit$best_iter))
+    resid_oof[va_idx] <- pred_resid
+    records[[length(records)+1L]] <- data.table(
+      config=config_name, fold=fold,
+      residual_rmse = rmse(pred_resid, y_va),
+      final_rmse_t1 = rmse(clip_pred(base_cv[va_idx]+pred_resid), y_r[va_idx]),
+      best_iter = fit$best_iter
+    )
+    cat(sprintf("%s fold %d: resid_rmse=%.6f, final=%.6f\n", config_name, fold,
+                records[[length(records)]]$residual_rmse, records[[length(records)]]$final_rmse_t1))
+  }
+  list(config=config_name, resid_oof=resid_oof, records=rbindlist(records))
+}
+
+# ── Run V4 ────────────────────────────────────────────────────────────────────
+v4_folds   <- stratified_folds(make_stratification(y_blend), N_FOLDS, RANDOM_SEED + 313L)
+base_v3_v4 <- v3_base_predictions(oof_blend, test_blend, y_blend, v4_folds)
+cat(sprintf("V4 base (v3 crossfit RMSE): %.6f\n", rmse(base_v3_v4$cv_oof, y_blend)))
+
+configs    <- c("resid_smooth", "resid_base", "resid_mid")  # <<TUNE>> remove configs to skip
+cv_results <- lapply(configs, run_residual_cv,
+                     train_base = train_base, train_raw = split_id_df(train),
+                     pred_oof = oof_blend, y_r = y_blend,
+                     folds = v4_folds, cat_cols = cat_cols, base_cv = base_v3_v4$cv_oof)
+
+# Shrinkage grid search
+shrink_grid <- seq(-0.3, 1.8, by = 0.01)  # <<TUNE>> widen if best is at boundary
+shrink_rows <- list()
+for (res in cv_results) {
+  for (s in shrink_grid) {
+    pred <- clip_pred(base_v3_v4$cv_oof + s * res$resid_oof)
+    shrink_rows[[length(shrink_rows)+1L]] <- data.table(config=res$config, shrink=s, cv_rmse=rmse(pred, y_blend))
+  }
+}
+shrink_results <- rbindlist(shrink_rows); setorder(shrink_results, cv_rmse)
+best_v4 <- shrink_results[1]
+cat(sprintf("Best V4: config=%s, shrink=%.2f, CV RMSE=%.6f\n", best_v4$config, best_v4$shrink, best_v4$cv_rmse))
+
+best_res_v4 <- cv_results[[which(vapply(cv_results, `[[`, character(1L), "config") == best_v4$config)]]
+best_oof_v4 <- clip_pred(base_v3_v4$cv_oof + best_v4$shrink * best_res_v4$resid_oof)
+
+fwrite(shrink_results, file.path(OUT_DIR_XGB, "v4_residual_shrink_results.csv"))
+cat("\n--- Best V4 config ---\n")
+print(shrink_results[1])
+
+# Final model trained on full data
+train_raw_v4 <- split_id_df(train)
+x_tr_v4 <- add_loo_group_stats(copy(train_base), train_raw_v4)
+x_te_v4 <- add_group_stats_for_prediction(copy(test_base), train_raw_v4)
+x_tr_v4 <- add_prediction_features(x_tr_v4, oof_blend, base_v3_v4$full_oof)
+x_te_v4 <- add_prediction_features(x_te_v4, test_blend, base_v3_v4$test)
+prep_v4  <- prepare_tree_numeric(x_tr_v4, NULL, x_te_v4, cat_cols)
+
+resid_target <- y_blend - base_v3_v4$full_oof
+params_v4    <- xgb_residual_params(best_v4$config, RANDOM_SEED + 4444L)
+mean_iter    <- round(mean(best_res_v4$records$best_iter))
+params_v4$nrounds <- max(40L, as.integer(mean_iter))
+ft_v4    <- xgb_feature_types(prep_v4$train, prep_v4$cat_cols)
+dtrain_v4 <- xgb.DMatrix(prep_v4$train, label=resid_target, missing=NA, feature_types=ft_v4)
+final_model_v4 <- xgb.train(params=within(params_v4, { nrounds <- NULL }),
+                             data=dtrain_v4, nrounds=params_v4$nrounds, verbose=0)
+test_resid_v4 <- clip_residual(predict_residual_xgb(final_model_v4, prep_v4$test, prep_v4$cat_cols, params_v4$nrounds))
+test_pred_v4  <- clip_pred(base_v3_v4$test + best_v4$shrink * test_resid_v4)
+
+v4_cal     <- fit_power_calibration(best_oof_v4, y_blend)
+v4_cv_rmse <- crossfit_power_calibration_rmse(best_oof_v4, y_blend, v4_folds)
+use_v4_pow <- rmse(v4_cal$pred, y_blend) < rmse(best_oof_v4, y_blend) && v4_cv_rmse <= best_v4$cv_rmse
+final_v4   <- if (use_v4_pow) apply_power_calibration(test_pred_v4, v4_cal$params) else test_pred_v4
+cat(sprintf("V4 power-cal used: %s\n", use_v4_pow))
+
+sub_v4 <- copy(sample); sub_v4[, y.hat := final_v4]
+fwrite(sub_v4, file.path(OUT_DIR_XGB, "submission_xgb_enhanced_v4_residual.csv"))
+fwrite(shrink_results, file.path(OUT_DIR_XGB, "v4_residual_shrink_results.csv"))
+cat(sprintf("Final V4 OOF RMSE: %.6f\n", rmse(best_oof_v4, y_blend)))
+cat("Saved:", file.path(OUT_DIR_XGB, "submission_xgb_enhanced_v4_residual.csv"), "\n")
+```
+
+---
+
+#something idk
+
+```{r}
+# ── Close logging sink ─────────────────────────────────────────────────────
+sink()
+
+```
+
+
+---
+
+# 📊 Results Summary
+
+```{r summary, eval=TRUE}
+# ── Final summary table ────────────────────────────────────────────────────
+summary_tbl <- data.table(
+  Stage = c("LGB Blend", "LGB PowerCal",
+            "XGB Blend", "XGB PowerCal",
+            "Son Flow Blend",
+            "V3 Ridge Meta",
+            "V4 Residual"),
+  OOF_RMSE = c(
+    lgb_blend$cv,    lgb_cal$rmse,
+    xgb_blend$cv,    xgb_cal$rmse,
+    rmse(son_blend$oof, y_blend),
+    rmse(v3_oof, y_blend),
+    rmse(best_oof_v4, y_blend)
+  )
+)
+setorder(summary_tbl, OOF_RMSE)
+cat("\n========== FINAL OOF RMSE COMPARISON ==========\n")
+print(summary_tbl)
+
+# Save to CSV
+fwrite(summary_tbl, file.path(OUT_DIR_XGB, "final_oof_rmse_summary.csv"))
+```
+
+---
+
+# 🗂️ Output Files Reference
+
+| File | Stage | Description |
+|------|-------|-------------|
+| `submissions/oof_predictions_r_*.csv` | Step 1 | LightGBM OOF predictions |
+| `submissions/test_model_predictions_r_*.csv` | Step 1 | LightGBM test predictions |
+| `submissions_xgb/oof_predictions_xgb_*.csv` | Step 2 | XGBoost OOF predictions |
+| `submissions_xgb/test_model_predictions_xgb_*.csv` | Step 2 | XGBoost test predictions |
+| `submissions_xgb/submission_son_flow_xgb_enhanced.csv` | Step 3 | Softmax blend |
+| `submissions_xgb/submission_xgb_enhanced_v3_ridge_meta.csv` | Step 4 | Ridge meta submission |
+| `submissions_xgb/submission_xgb_enhanced_v4_residual.csv` | **Step 5** | **Recommended submission** |
+| `submissions_xgb/ridge_meta_cv_results_v3.csv` | Step 4 | All lambda/set CV scores |
+| `submissions_xgb/v4_residual_shrink_results.csv` | Step 5 | Shrinkage search results |
+
+---
+
+*Generated by `healthcare_cost_pipeline.Rmd` — edit the **⚙️ Global Configuration** chunk at the top to change seeds, fold counts, file paths, or prediction bounds.*
+
+
+
+
