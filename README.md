@@ -10,11 +10,21 @@ The competition evaluates models using Root Mean Squared Error (RMSE).
 # Data
 The training set contains 25,873 rows and 32 columns and it includes the following categories: Age, gender, education level, insurance status, jobs, salaries, benefits.
 
+There are problems of missing value and outlier value. The missing monetary value is replaced by 0 and the categorial NA will be its own category. The outliner value can be handled well by LightGBM and XGBoost. 
+
 <img width="960" height="340" alt="{CE742949-9E09-49C4-A68E-C6F8526D214D}" src="https://github.com/user-attachments/assets/1148e18b-0696-4e5d-9f93-b638238710a9" />
 
 
 # Code
 Using R and many packages within, we made a healthcare cost prediction pipeline using LightGBM, XGBoost, ridge stacking, and residual correction, achieving a good predictive performance. 
+
+Base models are: LightGBM, XGBoost.
+A normal model directly predicts: E(Y|X).
+A hurdle model predict Y = O and Y > 0 seperately. 
+As a result, we have 4 models to work with.
+
+Then each model are rated with using softmax, the sum of the score is equal to 1. That scores are then used as weights to combine the predictions into a better prediction. 
+
 
 # Result
 The competition was hosted on Kaggle as part of the course assessment.
