@@ -1,5 +1,5 @@
 # Overview
-This group project was developed as the final assignment for the subject Predictive Analysis in Actuarial Science Program, National Economics University (NEU).
+This project was developed as the final assignment for the subject Predictive Analysis in Actuarial Science Program, National Economics University (NEU).
 
 The objective is to build predictive models for individual annual healthcare costs in Vietnam using demographic and socio-economic information to predict y:
 
