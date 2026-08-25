@@ -21,10 +21,6 @@ The competition was hosted on Kaggle as part of the course assessment.
 
 🏆 Final Ranking: 2nd Place in Class
 
-(the clone accounts do not count)
-
-<img width="724" height="379" alt="{1189E239-4681-4235-A13D-1ABE5939919E}" src="https://github.com/user-attachments/assets/1907906b-021c-4cfb-b34e-b12358e90f73" />
-
 
 # Authors
 This project would not have been possible without the contributions of our team:
